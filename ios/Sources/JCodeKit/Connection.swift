@@ -32,6 +32,9 @@ public actor Connection {
     public struct Configuration: Sendable {
         public var gateway: Gateway
         public var authToken: String
+        /// Absolute path on the server the session should work in. Required
+        /// by the server for a new subscription.
+        public var workingDir: String?
         /// Maximum reconnect attempts before reporting `.failed`. Nil retries forever.
         public var maxReconnectAttempts: Int?
         /// Base backoff delay in seconds, doubled per attempt and capped at 30s.
@@ -40,11 +43,13 @@ public actor Connection {
         public init(
             gateway: Gateway,
             authToken: String,
+            workingDir: String? = nil,
             maxReconnectAttempts: Int? = nil,
             baseBackoffSeconds: Double = 1.0
         ) {
             self.gateway = gateway
             self.authToken = authToken
+            self.workingDir = workingDir
             self.maxReconnectAttempts = maxReconnectAttempts
             self.baseBackoffSeconds = baseBackoffSeconds
         }
@@ -175,7 +180,10 @@ public actor Connection {
 
     private func subscribeAndSync() async throws {
         let sessionID = targetSessionID
-        try await send { .subscribe(id: $0, targetSessionID: sessionID) }
+        let workingDir = configuration.workingDir
+        try await send {
+            .subscribe(id: $0, targetSessionID: sessionID, workingDir: workingDir)
+        }
         try await send { .getHistory(id: $0) }
     }
 

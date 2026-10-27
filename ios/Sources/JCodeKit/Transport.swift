@@ -28,32 +28,20 @@ public actor URLSessionWebSocketTransport: WebSocketTransport {
         let task = URLSession.shared.webSocketTask(with: request)
         task.resume()
         self.task = task
-        // Force the handshake to complete (and surface auth failures) by
-        // sending a WebSocket-level ping before declaring success.
-        do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                task.sendPing { error in
-                    if let error {
-                        cont.resume(throwing: error)
-                    } else {
-                        cont.resume()
-                    }
-                }
-            }
-        } catch {
-            // The gateway rejects unknown/revoked tokens at the upgrade with
-            // 401. Surface that distinctly so the connection loop can stop
-            // retrying and prompt a re-pair instead of backing off forever.
-            if let http = task.response as? HTTPURLResponse, http.statusCode == 401 {
-                throw TransportError.unauthorized
-            }
-            throw error
-        }
+        // Do not gate on `sendPing`: its completion handler is not called
+        // reliably (observed on macOS against both ws:// and wss://), which
+        // left every attach stuck in `.connecting` forever. The upgrade's
+        // status is inspected on the first send/receive instead, which is
+        // where a revoked token surfaces as 401.
     }
 
     public func send(text: String) async throws {
         guard let task else { throw TransportError.notConnected }
-        try await task.send(.string(text))
+        do {
+            try await task.send(.string(text))
+        } catch {
+            throw Self.map(error, task: task)
+        }
     }
 
     public func receiveText() async throws -> String? {
@@ -68,7 +56,7 @@ public actor URLSessionWebSocketTransport: WebSocketTransport {
                 if task.closeCode != .invalid {
                     return nil
                 }
-                throw error
+                throw Self.map(error, task: task)
             }
             switch message {
             case .string(let text):
@@ -81,6 +69,16 @@ public actor URLSessionWebSocketTransport: WebSocketTransport {
                 continue
             }
         }
+    }
+
+    /// A revoked or unknown token rejects the upgrade with 401. Surface that
+    /// distinctly so the connection loop stops retrying and prompts a re-pair
+    /// instead of backing off forever.
+    private static func map(_ error: Error, task: URLSessionWebSocketTask) -> Error {
+        if let http = task.response as? HTTPURLResponse, http.statusCode == 401 {
+            return TransportError.unauthorized
+        }
+        return error
     }
 
     public func close() async {

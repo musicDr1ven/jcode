@@ -6,7 +6,7 @@ import Foundation
 /// snake_case tags). Only the requests the iOS app uses are modeled; the server
 /// ignores fields it does not expect.
 public enum Request: Equatable, Sendable {
-    case subscribe(id: UInt64, targetSessionID: String?)
+    case subscribe(id: UInt64, targetSessionID: String? = nil, workingDir: String? = nil)
     case message(id: UInt64, content: String)
     case cancel(id: UInt64)
     case softInterrupt(id: UInt64, content: String, urgent: Bool)
@@ -22,7 +22,7 @@ public enum Request: Equatable, Sendable {
 
     public var id: UInt64 {
         switch self {
-        case let .subscribe(id, _), let .message(id, _), let .cancel(id),
+        case let .subscribe(id, _, _), let .message(id, _), let .cancel(id),
             let .softInterrupt(id, _, _), let .cancelSoftInterrupts(id),
             let .ping(id), let .getHistory(id), let .resumeSession(id, _),
             let .setModel(id, _), let .setReasoningEffort(id, _), let .compact(id),
@@ -35,10 +35,16 @@ public enum Request: Equatable, Sendable {
     public func encodedLine() throws -> String {
         var object: [String: Any] = ["id": id]
         switch self {
-        case let .subscribe(_, targetSessionID):
+        case let .subscribe(_, targetSessionID, workingDir):
             object["type"] = "subscribe"
             if let targetSessionID {
                 object["target_session_id"] = targetSessionID
+            }
+            // The server refuses a fresh subscribe without an absolute path
+            // ("Subscribe requires the client's working directory"), so only
+            // send the key when we actually have one.
+            if let workingDir, !workingDir.isEmpty {
+                object["working_dir"] = workingDir
             }
         case let .message(_, content):
             object["type"] = "message"

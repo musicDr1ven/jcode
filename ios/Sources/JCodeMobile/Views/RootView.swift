@@ -26,13 +26,22 @@ struct RootView: View {
         }
         .onOpenURL { url in
             guard let payload = PairURI.parse(url.absoluteString) else { return }
+            // A QR link carries no working directory; reuse the one saved for
+            // this host, or pair anyway and ask for it afterwards.
+            let remembered =
+                model.servers.first { $0.host == payload.gateway.host }?.workingDir ?? ""
             Task {
                 do {
                     try await model.pair(
                         gateway: payload.gateway,
                         code: payload.code,
+                        workingDir: remembered,
                         deviceName: UIDevice.current.name
                     )
+                    if remembered.isEmpty {
+                        deepLinkError =
+                            "Paired. Set the working directory in Settings to start a session."
+                    }
                 } catch {
                     deepLinkError = "Pairing failed: \(error.localizedDescription)"
                 }

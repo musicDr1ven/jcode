@@ -12,6 +12,46 @@ import Testing
     #expect(gateway.webSocketURL.absoluteString == "ws://devbox.tailnet.ts.net:7643/ws")
 }
 
+@Test func gatewayBuildsTLSEndpoints() {
+    let gateway = Gateway(
+        host: "box.tailnet.ts.net",
+        port: 443,
+        security: .https
+    )
+    #expect(gateway.healthURL.absoluteString == "https://box.tailnet.ts.net:443/health")
+    #expect(gateway.pairURL.absoluteString == "https://box.tailnet.ts.net:443/pair")
+    #expect(gateway.webSocketURL.absoluteString == "wss://box.tailnet.ts.net:443/ws")
+    #expect(gateway.displayAddress == "https://box.tailnet.ts.net")
+}
+
+@Test func gatewayParsesUserInput() {
+    let bare = Gateway.parse("100.105.25.121")
+    #expect(bare?.host == "100.105.25.121")
+    #expect(bare?.port == 7643)
+    #expect(bare?.security == .http)
+
+    let withPort = Gateway.parse("100.105.25.121:9000")
+    #expect(withPort?.port == 9000)
+
+    let https = Gateway.parse("https://box.tailnet.ts.net")
+    #expect(https?.security == .https)
+    #expect(https?.port == 443)
+    #expect(https?.webSocketURL.scheme == "wss")
+
+    // A URL's own scheme and port win over the port field.
+    let explicit = Gateway.parse("https://box.tailnet.ts.net:8443/", port: 7643)
+    #expect(explicit?.port == 8443)
+    #expect(explicit?.security == .https)
+
+    let ws = Gateway.parse("ws://box.tailnet.ts.net:7643")
+    #expect(ws?.security == .http)
+
+    #expect(Gateway.parse("") == nil)
+    #expect(Gateway.parse("   ") == nil)
+    #expect(Gateway.parse("http://") == nil)
+    #expect(Gateway.parse("host:not-a-port") == nil)
+}
+
 @Test func pairURIParsesQRPayload() {
     let payload = PairURI.parse("jcode://pair?host=mybox.ts.net&port=7643&code=123456")
     #expect(payload?.gateway.host == "mybox.ts.net")
@@ -53,6 +93,18 @@ private func encodedObject(_ request: Request) throws -> [String: Any] {
 
     let bare = try encodedObject(.subscribe(id: 2, targetSessionID: nil))
     #expect(bare["target_session_id"] == nil)
+}
+
+@Test func encodesSubscribeWorkingDirectory() throws {
+    let object = try encodedObject(
+        .subscribe(id: 1, targetSessionID: nil, workingDir: "/home/gabe/project")
+    )
+    #expect(object["type"] as? String == "subscribe")
+    #expect(object["working_dir"] as? String == "/home/gabe/project")
+
+    // The server rejects an empty value, so it must be omitted rather than sent blank.
+    let empty = try encodedObject(.subscribe(id: 2, workingDir: ""))
+    #expect(empty["working_dir"] == nil)
 }
 
 @Test func encodesControlRequests() throws {

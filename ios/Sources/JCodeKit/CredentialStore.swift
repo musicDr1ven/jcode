@@ -2,10 +2,15 @@ import Foundation
 
 /// A saved server credential.
 public struct ServerCredential: Codable, Equatable, Sendable, Identifiable {
-    public var id: String { "\(host):\(port)" }
+    public var id: String { "\(security.rawValue):\(host):\(port)" }
 
     public var host: String
     public var port: UInt16
+    /// True when the server is reached over TLS (`tailscale serve`).
+    public var security: Gateway.Security
+    /// Absolute path the server should start sessions in. Empty means the
+    /// server has not been told yet, which a fresh subscribe cannot accept.
+    public var workingDir: String
     public var token: String
     public var serverName: String
     public var serverVersion: String
@@ -14,6 +19,8 @@ public struct ServerCredential: Codable, Equatable, Sendable, Identifiable {
     public init(
         host: String,
         port: UInt16,
+        security: Gateway.Security = .http,
+        workingDir: String = "",
         token: String,
         serverName: String,
         serverVersion: String,
@@ -21,14 +28,31 @@ public struct ServerCredential: Codable, Equatable, Sendable, Identifiable {
     ) {
         self.host = host
         self.port = port
+        self.security = security
+        self.workingDir = workingDir
         self.token = token
         self.serverName = serverName
         self.serverVersion = serverVersion
         self.pairedAt = pairedAt
     }
 
+    /// Credentials saved by earlier builds have neither `security` nor
+    /// `workingDir`; default them instead of dropping the pairing.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decode(String.self, forKey: .host)
+        port = try container.decode(UInt16.self, forKey: .port)
+        security =
+            try container.decodeIfPresent(Gateway.Security.self, forKey: .security) ?? .http
+        workingDir = try container.decodeIfPresent(String.self, forKey: .workingDir) ?? ""
+        token = try container.decode(String.self, forKey: .token)
+        serverName = try container.decode(String.self, forKey: .serverName)
+        serverVersion = try container.decode(String.self, forKey: .serverVersion)
+        pairedAt = try container.decode(Date.self, forKey: .pairedAt)
+    }
+
     public var gateway: Gateway {
-        Gateway(host: host, port: port)
+        Gateway(host: host, port: port, security: security)
     }
 }
 

@@ -100,6 +100,37 @@ private func makeConnection(transport: FakeTransport) -> Connection {
     await connection.stop()
 }
 
+@Test func subscribeCarriesWorkingDirectory() async throws {
+    let transport = FakeTransport()
+    let connection = Connection(
+        configuration: .init(
+            gateway: Gateway(host: "test.local"),
+            authToken: "tok",
+            workingDir: "/home/gabe/project",
+            maxReconnectAttempts: 1,
+            baseBackoffSeconds: 0.01
+        ),
+        makeTransport: { transport }
+    )
+    let stream = await connection.start()
+    var iterator = stream.makeAsyncIterator()
+    _ = await iterator.next()
+    _ = await iterator.next()
+
+    var sent: [String] = []
+    for _ in 0..<50 {
+        sent = await transport.sentLines
+        if !sent.isEmpty { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    #expect(sent.count >= 1)
+    let subscribeLine = try #require(sent.first)
+    let object = try JSONSerialization.jsonObject(with: Data(subscribeLine.utf8)) as? [String: Any]
+    #expect(object?["working_dir"] as? String == "/home/gabe/project")
+
+    await connection.stop()
+}
+
 @Test func decodesPushedEvents() async throws {
     let transport = FakeTransport()
     let connection = makeConnection(transport: transport)

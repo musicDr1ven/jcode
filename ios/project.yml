@@ -29,6 +29,10 @@ targets:
         MARKETING_VERSION: "2.0.0"
         CURRENT_PROJECT_VERSION: 1
         TARGETED_DEVICE_FAMILY: "1,2"
+        # Run the same SwiftUI client on the Mac as a Catalyst app, so a
+        # desktop can drive sessions without a terminal renderer in the path.
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: TAS6ARKDN7
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

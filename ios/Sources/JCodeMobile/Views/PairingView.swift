@@ -9,6 +9,7 @@ struct PairingView: View {
     @State private var host = ""
     @State private var port = String(Gateway.defaultPort)
     @State private var code = ""
+    @State private var workingDir = ""
     @State private var isPairing = false
     @State private var errorMessage: String?
     @State private var showScanner = false
@@ -27,14 +28,25 @@ struct PairingView: View {
 
                 Card {
                     VStack(alignment: .leading, spacing: 16) {
-                        field("Host", text: $host, placeholder: "devbox.tailnet.ts.net")
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .keyboardType(.URL)
+                        field(
+                            "Host",
+                            text: $host,
+                            placeholder: "100.64.1.5 or https://box.tailnet.ts.net"
+                        )
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
                         field("Port", text: $port, placeholder: "7643")
                             .keyboardType(.numberPad)
                         field("Pairing code", text: $code, placeholder: "123456")
                             .keyboardType(.numberPad)
+                        field(
+                            "Working directory",
+                            text: $workingDir,
+                            placeholder: "/home/you/project (required)"
+                        )
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     }
                 }
 
@@ -86,7 +98,7 @@ struct PairingView: View {
                 .accessibilityLabel("Scan QR code")
                 .accessibilityHint("Opens the camera to scan a pairing code")
 
-                Text("Run `jcode pair` on your machine, then scan the QR code or enter the code manually. Traffic stays on your tailnet.")
+                Text("Run `jcode pair` on your machine, then scan the QR code or enter the code manually.\n\nUse the plain tailnet IP on iPhone. On a Mac, use `https://<machine>.<tailnet>.ts.net` after running `tailscale serve --bg --https=443 http://127.0.0.1:7643`: macOS refuses cleartext HTTP to a tailnet address.\n\nWorking directory must be an absolute path that exists on the server.")
                     .font(.footnote)
                     .foregroundStyle(Theme.textTertiary)
             }
@@ -98,7 +110,7 @@ struct PairingView: View {
             QRScannerView { scanned in
                 showScanner = false
                 if let payload = PairURI.parse(scanned) {
-                    host = payload.gateway.host
+                    host = payload.gateway.displayAddress
                     port = String(payload.gateway.port)
                     code = payload.code
                     pair()
@@ -135,9 +147,13 @@ struct PairingView: View {
         .padding(.bottom, 4)
     }
 
+    private var resolvedGateway: Gateway? {
+        Gateway.parse(host, port: UInt16(port) ?? Gateway.defaultPort)
+    }
+
     private var canPair: Bool {
-        !host.trimmingCharacters(in: .whitespaces).isEmpty && !code.isEmpty
-            && UInt16(port) != nil
+        resolvedGateway != nil && !code.trimmingCharacters(in: .whitespaces).isEmpty
+            && !workingDir.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     private func field(_ label: String, text: Binding<String>, placeholder: String) -> some View {
@@ -165,9 +181,11 @@ struct PairingView: View {
     }
 
     private func pair() {
-        guard let portValue = UInt16(port) else { return }
-        let gateway = Gateway(host: host.trimmingCharacters(in: .whitespaces), port: portValue)
-        let pairCode = code
+        guard let gateway = resolvedGateway else {
+            errorMessage = "Enter a host like 100.64.1.5, or a URL like https://box.tailnet.ts.net"
+            return
+        }
+        let pairCode = code.trimmingCharacters(in: .whitespaces)
         isPairing = true
         errorMessage = nil
         Task {
@@ -176,6 +194,7 @@ struct PairingView: View {
                 try await model.pair(
                     gateway: gateway,
                     code: pairCode,
+                    workingDir: workingDir,
                     deviceName: UIDevice.current.name
                 )
             } catch let error as PairingClient.PairingError {
@@ -188,7 +207,7 @@ struct PairingView: View {
                     errorMessage = "Unexpected response from server"
                 }
             } catch {
-                errorMessage = "Could not reach \(gateway.host):\(gateway.port)"
+                errorMessage = "Could not reach \(gateway.displayAddress)"
             }
         }
     }

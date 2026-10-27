@@ -37,7 +37,12 @@ final class AppModel {
 
     // MARK: - Pairing
 
-    func pair(gateway: Gateway, code: String, deviceName: String) async throws {
+    func pair(
+        gateway: Gateway,
+        code: String,
+        workingDir: String,
+        deviceName: String
+    ) async throws {
         let client = PairingClient()
         let response = try await client.pair(
             gateway: gateway,
@@ -48,6 +53,8 @@ final class AppModel {
         let credential = ServerCredential(
             host: gateway.host,
             port: gateway.port,
+            security: gateway.security,
+            workingDir: workingDir.trimmingCharacters(in: .whitespaces),
             token: response.token,
             serverName: response.serverName,
             serverVersion: response.serverVersion
@@ -56,6 +63,17 @@ final class AppModel {
         servers = store.loadAll()
         activeServer = credential
         connect(to: credential)
+    }
+
+    /// Updates where the server starts sessions. Reconnects when the server is
+    /// active because the working directory is only sent on subscribe.
+    func setWorkingDir(_ directory: String, for credential: ServerCredential) {
+        var updated = credential
+        updated.workingDir = directory.trimmingCharacters(in: .whitespaces)
+        store.save(updated)
+        servers = store.loadAll()
+        guard activeServer?.id == credential.id else { return }
+        connect(to: updated, sessionID: session.sessionID)
     }
 
     func removeServer(_ credential: ServerCredential) {
@@ -87,7 +105,8 @@ final class AppModel {
         let connection = Connection(
             configuration: .init(
                 gateway: credential.gateway,
-                authToken: credential.token
+                authToken: credential.token,
+                workingDir: credential.workingDir.isEmpty ? nil : credential.workingDir
             )
         )
         self.connection = connection

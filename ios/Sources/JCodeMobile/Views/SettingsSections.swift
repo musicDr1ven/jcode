@@ -104,7 +104,7 @@ struct SettingsServersSection: View {
                             Text(server.serverName)
                                 .font(.body)
                                 .foregroundStyle(Theme.textPrimary)
-                            Text("\(server.host):\(String(server.port))")
+                            Text(server.gateway.displayAddress)
                                 .font(Theme.mono(11))
                                 .foregroundStyle(Theme.textTertiary)
                         }
@@ -144,6 +144,7 @@ struct SettingsServersSection: View {
 
 struct SettingsInfoSection: View {
     @Environment(AppModel.self) private var model
+    @State private var workingDirDraft = ""
 
     var body: some View {
         Section("Info") {
@@ -156,7 +157,32 @@ struct SettingsInfoSection: View {
             if let detail = model.session.statusDetail {
                 row("Status", detail)
             }
+            if let server = model.activeServer {
+                workingDirectoryRow(server)
+            }
         }
+    }
+
+    /// The server rejects a fresh subscribe without an absolute path, so this
+    /// has to be editable without re-pairing.
+    private func workingDirectoryRow(_ server: ServerCredential) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Working directory")
+                .font(.callout)
+                .foregroundStyle(Theme.textSecondary)
+            TextField("/home/you/project", text: $workingDirDraft)
+                .font(Theme.mono(12))
+                .foregroundStyle(Theme.textPrimary)
+                .tint(Theme.mint)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.done)
+                .onSubmit { model.setWorkingDir(workingDirDraft, for: server) }
+        }
+        .listRowBackground(Theme.surface)
+        .onAppear { workingDirDraft = server.workingDir }
+        .onChange(of: server.id) { _, _ in workingDirDraft = server.workingDir }
+        .accessibilityHint("Absolute path the server starts sessions in")
     }
 
     private func row(_ label: String, _ value: String) -> some View {

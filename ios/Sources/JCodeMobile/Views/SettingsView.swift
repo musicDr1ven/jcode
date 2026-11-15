@@ -54,6 +54,7 @@ struct SettingsView: View {
                         }
                     }
             }
+            .environment(model)
             .preferredColorScheme(.dark)
         }
         .onChange(of: model.activeServer?.id) {

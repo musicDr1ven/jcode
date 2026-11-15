@@ -60,7 +60,10 @@ struct ChatView: View {
             )
         }
         .sheet(isPresented: $showSettings) {
+            // Sheets do not inherit the `@Observable` environment object here;
+            // without this the settings sheet traps on first render.
             SettingsView()
+                .environment(model)
         }
         .sensoryFeedback(.impact(weight: .light), trigger: sendCount)
         .sensoryFeedback(.impact(flexibility: .soft), trigger: finishedToolCallCount) {

@@ -1,7 +1,7 @@
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
-    McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
-    config_env_fingerprint, populate_context_limits_from_config_ref,
+    McpToolsMode, PluginCapability, PluginGateFallback, ProviderConfig, SessionPickerResumeAction,
+    SwarmSpawnMode, ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -538,6 +538,97 @@ fn hooks_config_defaults_and_parses_from_toml() {
     let round_trip: Config = toml::from_str(&serialized).expect("serialized hooks should parse");
     assert_eq!(round_trip.hooks.turn_end, cfg.hooks.turn_end);
     assert_eq!(round_trip.hooks.pre_tool, cfg.hooks.pre_tool);
+}
+
+#[test]
+fn plugins_table_parses_with_zero_and_multiple_entries() {
+    let empty: Config = toml::from_str("").expect("empty config parses");
+    assert!(empty.plugins.is_empty());
+
+    let config: Config = toml::from_str(
+        r#"
+[[plugins]]
+name = "observer"
+command = "observer-bin"
+
+[[plugins]]
+name = "full"
+command = "full-bin"
+args = ["--mode", "test"]
+capabilities = ["observe", "context", "gate"]
+gate_fallback = "deny"
+[plugins.timeouts]
+handshake_ms = 750
+context_ms = 900
+"#,
+    )
+    .expect("plugin config parses");
+
+    assert_eq!(config.plugins.len(), 2);
+    // Defaults: observe-only grant, hooks-compatible fail-open gate fallback.
+    assert_eq!(
+        config.plugins[0].capabilities,
+        vec![PluginCapability::Observe]
+    );
+    assert_eq!(config.plugins[0].gate_fallback, PluginGateFallback::Allow);
+    assert_eq!(config.plugins[0].timeouts.handshake_ms, 3_000);
+    let full = &config.plugins[1];
+    assert_eq!(full.args, vec!["--mode".to_string(), "test".to_string()]);
+    assert_eq!(
+        full.capabilities,
+        vec![
+            PluginCapability::Observe,
+            PluginCapability::Context,
+            PluginCapability::Gate
+        ]
+    );
+    assert_eq!(full.gate_fallback, PluginGateFallback::Deny);
+    assert_eq!(full.timeouts.handshake_ms, 750);
+    assert_eq!(full.timeouts.context_ms, 900);
+    // Unset per-point timeouts keep their documented defaults.
+    assert_eq!(full.timeouts.tool_gate_ms, 2_000);
+}
+
+#[test]
+fn plugin_env_overrides_win_over_the_config_file() {
+    let _lock = crate::storage::lock_test_env();
+    let keys = ["JCODE_PLUGINS", "JCODE_PLUGIN_REFERENCE_COMMAND"];
+    let saved = keys
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+    for key in keys {
+        crate::env::remove_var(key);
+    }
+
+    let mut config: Config = toml::from_str(
+        r#"
+[[plugins]]
+name = "reference"
+command = "from-config"
+capabilities = ["observe"]
+"#,
+    )
+    .expect("config parses");
+    config.apply_env_overrides();
+    assert_eq!(config.plugins[0].command, "from-config");
+
+    crate::env::set_var("JCODE_PLUGIN_REFERENCE_COMMAND", " from-env ");
+    config.apply_env_overrides();
+    assert_eq!(config.plugins[0].command, "from-env");
+
+    // The list form replaces the whole configured set.
+    crate::env::set_var(
+        "JCODE_PLUGINS",
+        "[[plugins]]\nname = \"replacement\"\ncommand = \"replacement-bin\"\n",
+    );
+    config.apply_env_overrides();
+    assert_eq!(config.plugins.len(), 1);
+    assert_eq!(config.plugins[0].name, "replacement");
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
 }
 
 #[test]

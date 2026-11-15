@@ -10,7 +10,8 @@ pub use jcode_config_types::{
     GatewayConfig, HookCommands, HooksConfig, KeybindingsConfig, LatexRenderingMode,
     LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
     NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
-    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    NotificationsConfig, PluginCapability, PluginConfig, PluginGateFallback, PluginTimeouts,
+    PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
     SessionConfig, SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout,
     TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
@@ -119,6 +120,7 @@ voice_jev_model = "typesafe/jev-1.14"
 }
 
 const CONFIG_ENV_KEYS: &[&str] = &[
+    "JCODE_PLUGINS",
     "JCODE_HIBERNATION_IDLE_SECS",
     "JCODE_HIBERNATION_MODE",
     "JCODE_REQUEST_COMPRESSION",
@@ -522,7 +524,10 @@ fn config_env_fingerprint() -> Vec<(String, String)> {
     let mut values = std::env::vars_os()
         .filter_map(|(key, value)| {
             let key = key.to_string_lossy().to_string();
-            if CONFIG_ENV_KEYS.contains(&key.as_str()) {
+            // `JCODE_PLUGIN_<NAME>_COMMAND` is per-plugin and therefore
+            // dynamic; keep it in the fingerprint by prefix so an override
+            // change still triggers a config reload.
+            if CONFIG_ENV_KEYS.contains(&key.as_str()) || key.starts_with("JCODE_PLUGIN_") {
                 Some((key, value.to_string_lossy().to_string()))
             } else {
                 None
@@ -645,6 +650,11 @@ pub struct Config {
 
     /// Lifecycle hooks (external commands at turn/session/tool boundaries)
     pub hooks: HooksConfig,
+
+    /// Long-lived extension plugins (`[[plugins]]`). Empty by default, and the
+    /// no-plugin path must stay byte-for-byte the behaviour it has without this
+    /// table. See `docs/PLUGINS.md`.
+    pub plugins: Vec<PluginConfig>,
 
     /// Ambient mode configuration
     pub ambient: AmbientConfig,

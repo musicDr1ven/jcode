@@ -370,6 +370,19 @@ impl Agent {
                 }
                 messages_with_memory.push(memory_msg);
             }
+            // Plugin contributions are appended after history and after
+            // memory, in configured plugin order (design D2/D9). Track them as
+            // ephemeral suffix content so the stable prefix is untouched.
+            let plugin_context = crate::agent::plugin_context::append_plugin_context(
+                &mut messages_with_memory,
+                &self.session.id,
+                self.working_dir(),
+            )
+            .await;
+            for message in plugin_context {
+                ephemeral_signature_messages.push(message);
+            }
+
             // Surface background plan-limit hits once so the user sees the
             // upgrade prompt in the reply (see turn_loops for rationale).
             if let Some(notice) = self

@@ -160,6 +160,19 @@ both paths call it.
 - **A wedged plugin stalls a turn** → hard timeout per extension point, and a hard kill on session
   teardown.
 
+### Implementation notes
+
+- **Reference plugin (open question 1): a script.** `scripts/reference_plugin.py`
+  exercises every extension point from outside the workspace, adds no crate or
+  build time, and can be driven by hand. The host's own tests use a minimal shell
+  plugin instead, so CI does not depend on Python.
+- **Capabilities** are `observe` (session/turn events), `tool_events`
+  (`pre_tool`/`post_tool`, which carry tool names and inputs), `context`,
+  `tools`, and `gate`. The effective grant is configuration ∩ the plugin's
+  declared capabilities.
+- **Per-plugin endpoint instrumentation** lives in the plugin host, not the turn
+  loops: the turn loops only decide whether any plugin is configured.
+
 ## Migration Plan
 
 Additive. With no `[[plugins]]` entries, configuration is unchanged and behaviour is identical; existing

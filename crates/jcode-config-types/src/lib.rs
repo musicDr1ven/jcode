@@ -931,6 +931,130 @@ impl<'de> Deserialize<'de> for HookCommands {
     }
 }
 
+/// A declared jcode plugin (`[[plugins]]` in config.toml).
+///
+/// Plugins are long-lived child processes that speak line-delimited JSON on
+/// stdio. See `docs/PLUGINS.md` for the protocol and `docs/HOOKS.md` for when to
+/// reach for a hook instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginConfig {
+    /// Operator-chosen name. Used in diagnostics, tool prefixes, and env
+    /// overrides (`JCODE_PLUGIN_<NAME>_COMMAND`).
+    pub name: String,
+    /// Executable to launch. Resolved by the OS, like a hook command.
+    pub command: String,
+    /// Arguments passed to the executable (never shell-expanded).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extension points this operator grants the plugin. The plugin may ask for
+    /// less at handshake time; it can never widen this grant.
+    #[serde(default = "default_plugin_capabilities")]
+    pub capabilities: Vec<PluginCapability>,
+    /// Per-extension-point deadlines. A missed deadline degrades that point.
+    #[serde(default)]
+    pub timeouts: PluginTimeouts,
+    /// What jcode does when a gate does not answer in time. Fail-open by
+    /// default, matching hooks; configurable to fail-closed.
+    #[serde(default)]
+    pub gate_fallback: PluginGateFallback,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            capabilities: default_plugin_capabilities(),
+            timeouts: PluginTimeouts::default(),
+            gate_fallback: PluginGateFallback::default(),
+        }
+    }
+}
+
+fn default_plugin_capabilities() -> Vec<PluginCapability> {
+    vec![PluginCapability::Observe]
+}
+
+/// An extension point a plugin may be granted and may declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCapability {
+    /// `session_start`, `session_end`, `turn_start`, `turn_end` notifications.
+    Observe,
+    /// `pre_tool` / `post_tool` notifications, which carry tool names and inputs.
+    ToolEvents,
+    /// Context contribution before a model request.
+    Context,
+    /// Tool registration.
+    Tools,
+    /// Tool-call gating and input rewriting.
+    Gate,
+}
+
+impl PluginCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::ToolEvents => "tool_events",
+            Self::Context => "context",
+            Self::Tools => "tools",
+            Self::Gate => "gate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "observe" => Some(Self::Observe),
+            "tool_events" | "tool-events" => Some(Self::ToolEvents),
+            "context" => Some(Self::Context),
+            "tools" => Some(Self::Tools),
+            "gate" => Some(Self::Gate),
+            _ => None,
+        }
+    }
+}
+
+/// Per-extension-point deadlines for one plugin, in milliseconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginTimeouts {
+    /// Handshake deadline at first use.
+    pub handshake_ms: u64,
+    /// Fire-and-forget event write deadline.
+    pub event_ms: u64,
+    /// Context contribution round trip.
+    pub context_ms: u64,
+    /// Gate decision round trip.
+    pub tool_gate_ms: u64,
+    /// Plugin tool execution round trip.
+    pub tool_call_ms: u64,
+}
+
+impl Default for PluginTimeouts {
+    fn default() -> Self {
+        Self {
+            handshake_ms: 3_000,
+            event_ms: 1_000,
+            context_ms: 2_000,
+            tool_gate_ms: 2_000,
+            tool_call_ms: 30_000,
+        }
+    }
+}
+
+/// What jcode does when a gate returns no decision (timeout or malformed reply).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginGateFallback {
+    /// Permit the call (hooks' existing fail-open behavior). Default.
+    #[default]
+    Allow,
+    /// Block the call and report the reason.
+    Deny,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HooksConfig {

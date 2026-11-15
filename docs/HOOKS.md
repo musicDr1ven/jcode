@@ -280,3 +280,18 @@ post_tool     = "~/bin/jcode-event-log"
   building any payload, so unconfigured hooks cost ~nothing.
 - The recursion guard (`JCODE_HOOKS_DISABLED=1`) means a hook may safely call
   `jcode` CLI commands without re-triggering hooks in that nested process.
+
+## Hooks or plugins?
+
+Use a **hook** when you need a one-shot command per event with no state: a
+notifier, a CI trigger, a formatter after an edit. Hooks are zero-install (a
+command string in config), run once per event, and cannot hold state across
+events.
+
+Use a **[plugin](PLUGINS.md)** when the integration is stateful or needs to
+answer jcode: long-lived state, a context contribution before generation, a tool
+the model can call, or a gate/rewrite decision. A plugin is one process per
+session speaking line-delimited JSON.
+
+Both can be configured for the same event; both receive it. Hooks keep their
+normal env-var/stdio semantics, and a plugin failure never disables hooks.

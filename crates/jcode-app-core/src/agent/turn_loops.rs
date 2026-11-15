@@ -169,6 +169,16 @@ impl Agent {
                 batch_nudge_pending = false;
                 sequential_single_tool_rounds = 0;
             }
+            // Plugin contributions are appended after history and after
+            // memory, in configured plugin order (design D2/D9). They are
+            // ephemeral: never persisted into the transcript.
+            let _plugin_context = crate::agent::plugin_context::append_plugin_context(
+                &mut messages_with_memory,
+                &self.session.id,
+                self.working_dir(),
+            )
+            .await;
+
             // Background features (memory recall) can hit a plan limit with no
             // visible failure. Surface it once through the agent so every UI
             // shows the upgrade prompt instead of silently degrading.

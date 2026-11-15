@@ -570,6 +570,54 @@ impl Config {
             }
         }
 
+        // Plugins. `JCODE_PLUGINS` replaces the whole list (TOML array of
+        // tables), mirroring the hook override style; per-plugin command
+        // overrides win over the config file for a named entry.
+        if let Ok(v) = std::env::var("JCODE_PLUGINS") {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                self.plugins.clear();
+            } else {
+                #[derive(serde::Deserialize)]
+                struct PluginsDoc {
+                    plugins: Vec<jcode_config_types::PluginConfig>,
+                }
+                if let Ok(doc) = toml::from_str::<PluginsDoc>(trimmed) {
+                    self.plugins = doc.plugins;
+                } else if let Ok(list) =
+                    toml::from_str::<Vec<jcode_config_types::PluginConfig>>(trimmed)
+                {
+                    self.plugins = list;
+                } else {
+                    crate::logging::warn(
+                        "Ignoring JCODE_PLUGINS: expected a TOML [[plugins]] table array",
+                    );
+                }
+            }
+        }
+        for plugin in &mut self.plugins {
+            let key = format!(
+                "JCODE_PLUGIN_{}_COMMAND",
+                plugin
+                    .name
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            );
+            if let Ok(command) = std::env::var(&key) {
+                let trimmed = command.trim();
+                if trimmed.is_empty() {
+                    plugin.command.clear();
+                } else {
+                    plugin.command = trimmed.to_string();
+                }
+            }
+        }
+
         // Web search
         if let Ok(v) = std::env::var("JCODE_WEBSEARCH_ENGINE")
             && let Some(engine) = WebSearchEngine::parse(&v)

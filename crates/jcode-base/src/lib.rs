@@ -51,6 +51,8 @@ pub mod gmail;
 pub mod goal;
 pub mod google_calendar;
 pub mod hooks;
+
+pub mod plugins;
 pub mod id;
 pub mod image_normalize;
 pub mod import;

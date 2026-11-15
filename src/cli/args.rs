@@ -191,6 +191,12 @@ pub(crate) enum Command {
         action: ServerCommand,
     },
 
+    /// Inspect and test configured extension plugins
+    Plugin {
+        #[command(subcommand)]
+        action: PluginCommand,
+    },
+
     /// Connect to a running server
     Connect,
 
@@ -718,6 +724,26 @@ pub(crate) enum ServerCommand {
         /// Confirm that terminating the daemon (and dropping live sessions) is intended.
         #[arg(long)]
         force: bool,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCommand {
+    /// List every configured plugin and whether it is usable
+    List {
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start a plugin, complete the handshake, report it, and stop it
+    Test {
+        /// Configured plugin name
+        name: String,
 
         /// Emit JSON instead of human-readable text
         #[arg(long)]

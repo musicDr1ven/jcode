@@ -38,6 +38,7 @@ pub mod mcp;
 mod memory;
 mod name_suggestions;
 mod open;
+mod plugin_tool;
 mod panel;
 mod patch;
 mod read;
@@ -120,6 +121,11 @@ struct SessionToolPolicy {
 
 static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
     LazyLock::new(|| StdRwLock::new(HashMap::new()));
+
+/// Sessions whose plugin tools have already been registered. Registration is
+/// idempotent per session; the registry itself stays the source of truth.
+static PLUGIN_TOOLS_REGISTERED: LazyLock<StdRwLock<HashSet<String>>> =
+    LazyLock::new(|| StdRwLock::new(HashSet::new()));
 static NEXT_SESSION_TOOL_POLICY_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Removes an Agent-owned policy when that Agent actually leaves memory.
@@ -881,6 +887,20 @@ impl Registry {
         result: &Result<ToolOutput>,
         latency_ms: u64,
     ) {
+        if crate::plugins::enabled() {
+            let event = Self::post_tool_event("post_tool", resolved_name, input, ctx, result.as_ref(), latency_ms);
+            let payload = crate::agent::plugin_context::payload_from_hook_event(&event);
+            let cwd = ctx
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string());
+            crate::plugins::emit_tool_event(
+                &ctx.session_id,
+                cwd.as_deref(),
+                "post_tool",
+                payload,
+            );
+        }
         if !crate::hooks::hook_configured("post_tool") {
             return;
         }
@@ -1110,6 +1130,47 @@ impl Registry {
                 crate::logging::event_warn("TOOL_LIFECYCLE", fields);
                 return Err(anyhow::anyhow!(
                     "Tool call blocked by pre_tool hook: {reason}"
+                ));
+            }
+        }
+
+        // Plugin gates run after the hook gate and before execution, in
+        // configured order; a rewrite is what executes and a denial is returned
+        // to the model as the tool error. Skipped entirely when no plugin is
+        // configured (design D8).
+        if crate::plugins::enabled() {
+            let plugin_payload = serde_json::json!({
+                "session_id": ctx.session_id.clone(),
+                "cwd": working_dir.clone(),
+                "tool_name": resolved_name,
+                "tool_call_id": ctx.tool_call_id.clone(),
+                "tool_input": crate::hooks::truncate_tool_input(&input.to_string()),
+                "touched_paths": Self::touched_paths(&input, &ctx)
+                    .into_iter()
+                    .map(|(_, path)| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            });
+            crate::plugins::emit_tool_event(
+                &ctx.session_id,
+                working_dir.as_deref(),
+                "pre_tool",
+                plugin_payload,
+            );
+            let outcome = crate::plugins::gate_tool(
+                &ctx.session_id,
+                working_dir.as_deref(),
+                resolved_name,
+                input.clone(),
+            )
+            .await;
+            input = outcome.input;
+            if let crate::plugins::GateDecision::Deny(reason) = outcome.decision {
+                let mut fields =
+                    Self::tool_lifecycle_fields("blocked", name, resolved_name, &input, &ctx);
+                fields.push(("block_reason".to_string(), reason.clone()));
+                crate::logging::event_warn("TOOL_LIFECYCLE", fields);
+                return Err(anyhow::anyhow!(
+                    "Tool call blocked by plugin gate: {reason}"
                 ));
             }
         }
@@ -1839,6 +1900,38 @@ impl Registry {
     }
 
     /// Register self-dev tools (only for canary/self-dev sessions)
+    /// Register the tools offered by configured plugins, once per session,
+    /// through the same dynamic path MCP uses (design D5). Prefixed names keep
+    /// them distinguishable and unable to shadow a built-in.
+    pub(crate) async fn register_plugin_tools(&self, session_id: &str, cwd: Option<&str>) {
+        if !crate::plugins::enabled() {
+            return;
+        }
+        {
+            let mut registered = PLUGIN_TOOLS_REGISTERED
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !registered.insert(session_id.to_string()) {
+                return;
+            }
+        }
+        let taken: HashSet<String> = self.tools.read().await.keys().cloned().collect();
+        let specs = crate::plugins::plugin_tool_specs(session_id, cwd, &taken).await;
+        if !specs.is_empty() {
+            crate::logging::info(&format!(
+                "Registering {} plugin tool(s) for session {session_id}",
+                specs.len()
+            ));
+        }
+        for spec in specs {
+            self.register(
+                spec.flattened_name.clone(),
+                Arc::new(plugin_tool::PluginTool::new(spec)),
+            )
+            .await;
+        }
+    }
+
     pub async fn register_selfdev_tools(&self) {
         // Self-dev management tool
         let selfdev_tool = selfdev::SelfDevTool::new();

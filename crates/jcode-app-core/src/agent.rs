@@ -12,6 +12,7 @@ mod messages;
 #[cfg(test)]
 mod model_usage_tests;
 mod prompting;
+pub(crate) mod plugin_context;
 mod provider;
 mod response_recovery;
 mod status;
@@ -1283,6 +1284,22 @@ impl Agent {
     /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
     /// No-op when the hook is not configured.
     pub(crate) fn fire_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
+        if crate::plugins::enabled() {
+            let cwd = self.working_dir().map(str::to_string);
+            let mut payload = serde_json::json!({
+                "session_id": self.session.id.clone(),
+                "source": source,
+                "model": self.provider_model(),
+            });
+            if let Some(cwd) = &cwd {
+                payload["cwd"] = serde_json::json!(cwd);
+            }
+            if event_name == "session_start" {
+                crate::plugins::session_started(&self.session.id, cwd.as_deref(), payload);
+            } else {
+                crate::plugins::session_ended(&self.session.id, payload);
+            }
+        }
         if !crate::hooks::hook_configured(event_name) {
             return;
         }

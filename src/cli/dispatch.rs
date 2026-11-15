@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::args::{
     AmbientCommand, Args, AuthCommand, CloudCommand, CloudSessionsCommand, Command, MemoryCommand,
-    ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
+    ModelCommand, PluginCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
     TranscriptModeArg,
 };
 use crate::{
@@ -240,6 +240,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             let legacy_socket = jcode_harness_api_server::legacy_socket_path();
             jcode_harness_api_server::run_bridge(api_socket, legacy_socket).await?;
         }
+        Some(Command::Plugin { action }) => match action {
+            PluginCommand::List { json } => {
+                crate::cli::plugin_cmd::run_list(json).await?;
+            }
+            PluginCommand::Test { name, json } => {
+                crate::cli::plugin_cmd::run_test(&name, json).await?;
+            }
+        },
         Some(Command::Server { action }) => match action {
             #[cfg(unix)]
             ServerCommand::Stdio => {

@@ -283,6 +283,21 @@ impl Agent {
     /// submission and the first tool call. No-op (without building the payload)
     /// when the hook is not configured.
     fn fire_turn_start_hook(&self, source: &str) {
+        if crate::plugins::enabled() {
+            let cwd = self.working_dir().map(str::to_string);
+            let payload = serde_json::json!({
+                "session_id": self.session.id.clone(),
+                "cwd": cwd,
+                "model": self.provider_model(),
+                "source": source,
+            });
+            crate::plugins::emit_observe_event(
+                &self.session.id,
+                cwd.as_deref(),
+                "turn_start",
+                payload,
+            );
+        }
         if !crate::hooks::hook_configured("turn_start") {
             return;
         }
@@ -304,6 +319,47 @@ impl Agent {
         started_at: Instant,
         start_message_index: usize,
     ) {
+        if crate::plugins::enabled() {
+            let cwd = self.working_dir().map(str::to_string);
+            let mut payload = serde_json::json!({
+                "session_id": self.session.id.clone(),
+                "cwd": cwd,
+                "status": if result.is_ok() { "ok" } else { "error" },
+                "duration_ms": started_at.elapsed().as_millis().to_string(),
+                "model": self.provider_model(),
+            });
+            if let Some(text) = self.latest_assistant_text_after(start_message_index) {
+                const LAST_TEXT_LIMIT: usize = 4000;
+                payload["last_assistant_text"] =
+                    serde_json::json!(text.chars().take(LAST_TEXT_LIMIT).collect::<String>());
+            }
+            if let Some(usage) = turn_token_usage_after(&self.session.messages, start_message_index)
+            {
+                if let Some(value) = usage.prompt_tokens {
+                    payload["prompt_tokens"] = serde_json::json!(value);
+                }
+                payload["input_tokens"] = serde_json::json!(usage.input_tokens);
+                payload["output_tokens"] = serde_json::json!(usage.output_tokens);
+                if let Some(value) = usage.cache_read_input_tokens {
+                    payload["cache_read_tokens"] = serde_json::json!(value);
+                }
+                if let Some(value) = usage.cache_creation_input_tokens {
+                    payload["cache_write_tokens"] = serde_json::json!(value);
+                }
+            }
+            if let Err(error) = result {
+                const ERROR_LIMIT: usize = 1000;
+                payload["error"] = serde_json::json!(
+                    error.to_string().chars().take(ERROR_LIMIT).collect::<String>()
+                );
+            }
+            crate::plugins::emit_observe_event(
+                &self.session.id,
+                cwd.as_deref(),
+                "turn_end",
+                payload,
+            );
+        }
         if !crate::hooks::hook_configured("turn_end") {
             return;
         }
@@ -471,6 +527,12 @@ impl Agent {
     pub(super) async fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
         if self.session.is_canary {
             self.registry.register_selfdev_tools().await;
+        }
+        if crate::plugins::enabled() {
+            let cwd = self.working_dir().map(str::to_string);
+            self.registry
+                .register_plugin_tools(&self.session.id, cwd.as_deref())
+                .await;
         }
 
         // Provider-native deferred MCP loading: MCP definitions live outside
@@ -999,6 +1061,12 @@ impl Agent {
     pub async fn tool_definitions_for_debug(&self) -> Vec<crate::message::ToolDefinition> {
         if self.session.is_canary {
             self.registry.register_selfdev_tools().await;
+        }
+        if crate::plugins::enabled() {
+            let cwd = self.working_dir().map(str::to_string);
+            self.registry
+                .register_plugin_tools(&self.session.id, cwd.as_deref())
+                .await;
         }
         self.build_filtered_tool_definitions().await
     }

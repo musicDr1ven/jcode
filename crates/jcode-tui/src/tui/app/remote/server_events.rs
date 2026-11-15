@@ -1522,9 +1522,18 @@ pub(in crate::tui::app) fn handle_server_event(
                 }
             });
             if !is_failover_prompt {
+                // Keep the provider's own text as the evidence, and add the
+                // likely cause when the id belongs to another configured
+                // provider (model/endpoint rejections only).
+                let content = crate::tui::app::commands::enriched_model_rejection(
+                    &message,
+                    &app.provider_model(),
+                    &app.provider_name(),
+                    crate::provider::configured_model_owner,
+                );
                 app.push_display_message(DisplayMessage {
                     role: "error".to_string(),
-                    content: App::compact_provider_failure(&message),
+                    content,
                     tool_calls: vec![],
                     duration_secs: None,
                     title: None,

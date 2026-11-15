@@ -167,6 +167,98 @@ fn model_not_found_is_fatal_model_endpoint_error() {
     assert!(is_fatal_model_endpoint_error(err));
 }
 
+// --- model rejection enrichment (5.1-5.3) ---
+
+fn chutes_owner() -> crate::provider::ConfiguredModelOwner {
+    crate::provider::ConfiguredModelOwner {
+        display_name: "Chutes".to_string(),
+        switch_prefix: "chutes".to_string(),
+    }
+}
+
+const MODEL_NOT_FOUND: &str = "chat request failed\n  status: 404 Not Found\n  response: {\"error\":{\"code\":\"model_not_found\",\"message\":\"The model `chutes-only-id` does not exist\"}}";
+
+#[test]
+fn model_rejection_names_the_provider_that_serves_the_id() {
+    use super::enriched_model_rejection;
+    let enriched =
+        enriched_model_rejection(MODEL_NOT_FOUND, "chutes-only-id", "OpenRouter", |_| {
+            Some(chutes_owner())
+        });
+    assert!(
+        enriched.contains("served by Chutes"),
+        "must name the owning provider: {enriched}"
+    );
+    assert!(
+        enriched.contains("`/model chutes:chutes-only-id`"),
+        "must suggest a spec that set_model accepts: {enriched}"
+    );
+}
+
+#[test]
+fn model_rejection_keeps_the_providers_raw_message() {
+    use super::enriched_model_rejection;
+    let enriched =
+        enriched_model_rejection(MODEL_NOT_FOUND, "chutes-only-id", "OpenRouter", |_| {
+            Some(chutes_owner())
+        });
+    assert!(
+        enriched.contains("The model `chutes-only-id` does not exist"),
+        "the provider's own text is the evidence and must survive: {enriched}"
+    );
+    assert!(
+        enriched.starts_with("chat request failed"),
+        "the enrichment is additive, not a replacement: {enriched}"
+    );
+}
+
+#[test]
+fn model_rejection_states_when_no_configured_provider_serves_the_id() {
+    use super::enriched_model_rejection;
+    let enriched =
+        enriched_model_rejection(MODEL_NOT_FOUND, "chutes-only-id", "OpenRouter", |_| None);
+    assert!(
+        enriched.contains("No configured provider lists `chutes-only-id`"),
+        "the genuinely-unknown case must say so: {enriched}"
+    );
+    assert!(
+        enriched.contains("The model `chutes-only-id` does not exist"),
+        "the raw cause must remain: {enriched}"
+    );
+}
+
+#[test]
+fn model_rejection_does_not_name_the_active_provider_itself() {
+    use super::enriched_model_rejection;
+    let enriched = enriched_model_rejection(MODEL_NOT_FOUND, "chutes-only-id", "Chutes", |_| {
+        Some(chutes_owner())
+    });
+    assert!(
+        !enriched.contains("served by Chutes"),
+        "the active provider is not the likely cause: {enriched}"
+    );
+}
+
+#[test]
+fn unrelated_failures_are_never_enriched_with_model_ownership() {
+    use super::enriched_model_rejection;
+    let unrelated = [
+        "claude request failed\n  status: 401 Unauthorized\n  response: invalid_api_key",
+        "openai request failed\n  status: 429 Too Many Requests\n  response: rate limit exceeded",
+        "openai request failed\n  status: 413 Payload Too Large\n  response: request too large",
+    ];
+    for error in unrelated {
+        let enriched = enriched_model_rejection(error, "some-model", "OpenRouter", |_| {
+            panic!("ownership must not be consulted for an unrelated failure")
+        });
+        assert_eq!(
+            enriched,
+            crate::tui::app::App::compact_provider_failure(error),
+            "unrelated failures must keep their exact message"
+        );
+    }
+}
+
 /// Behavioral tests for `/colors`, driven through the real `App` so they cover
 /// what a user actually types: dispatch, message text, config persistence, and
 /// error handling.

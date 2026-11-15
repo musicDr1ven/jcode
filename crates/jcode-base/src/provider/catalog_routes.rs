@@ -665,7 +665,7 @@ fn append_openai_compatible_profile_routes(
 ///
 /// Text-capable static models plus the profile's `default_model` are offered;
 /// models declared image-only via `input = ["image"]` are excluded.
-fn named_provider_profile_routes(
+pub(super) fn named_provider_profile_routes(
     profile_name: &str,
     profile_config: &crate::config::NamedProviderConfig,
 ) -> Vec<ModelRoute> {

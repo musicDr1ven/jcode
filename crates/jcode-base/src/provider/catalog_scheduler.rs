@@ -84,6 +84,17 @@ pub(crate) fn profile_catalog_cache_needs_refresh(
     }
 }
 
+/// Run one sweep now instead of waiting for the next interval.
+///
+/// Credential changes call this: a provider that was configured mid-session has
+/// no cached catalog yet, and route building is deliberately pure (it never
+/// fetches), so without this its live models stay unavailable until the next
+/// scheduled sweep. Returns the number of refreshes actually scheduled, which is
+/// zero when every configured catalog is fresh.
+pub fn sweep_stale_profile_catalogs_now() -> usize {
+    sweep_stale_profile_catalogs()
+}
+
 /// Schedule refreshes for every configured profile whose catalog cache is
 /// stale or missing. Returns the number of refreshes actually scheduled, which
 /// is typically zero on most sweeps.

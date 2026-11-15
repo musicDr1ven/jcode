@@ -283,6 +283,56 @@ fn direct_openai_compatible_profile_routes(
     routes
 }
 
+/// A configured provider that lists a model, described for diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredModelOwner {
+    /// Human-facing provider name, for prose.
+    pub display_name: String,
+    /// Prefix `set_model` accepts to select this provider directly
+    /// (`<prefix>:<model>`), so the suggested fix actually resolves.
+    pub switch_prefix: String,
+}
+
+/// The configured provider whose catalog lists `model`, if any.
+///
+/// Used to explain a provider-side "model does not exist" rejection: a hit means
+/// the id belongs to another configured provider and the request reached the
+/// wrong endpoint. Checks OpenAI-compatible profiles and `[providers.<name>]`
+/// entries against the same route data the picker shows, so ownership and
+/// discovery cannot disagree about what a provider serves.
+pub fn configured_model_owner(model: &str) -> Option<ConfiguredModelOwner> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    for profile in crate::provider_catalog::openai_compatible_profiles() {
+        if !crate::provider_catalog::openai_compatible_profile_is_configured(*profile) {
+            continue;
+        }
+        if direct_openai_compatible_profile_routes(*profile)
+            .iter()
+            .any(|route| route.model == model)
+        {
+            return Some(ConfiguredModelOwner {
+                display_name: profile.display_name.to_string(),
+                switch_prefix: profile.id.to_string(),
+            });
+        }
+    }
+    for (name, config) in &crate::config::config().providers {
+        if catalog_routes::named_provider_profile_routes(name, config)
+            .iter()
+            .any(|route| route.model == model)
+        {
+            return Some(ConfiguredModelOwner {
+                display_name: name.clone(),
+                switch_prefix: name.clone(),
+            });
+        }
+    }
+    None
+}
+
 fn standard_openrouter_profile_configured() -> bool {
     crate::provider_catalog::load_env_value_from_env_or_config(
         "OPENROUTER_API_KEY",
@@ -441,6 +491,12 @@ pub struct MultiProvider {
     /// Shared by forks so the server can wait for real work rather than sleeping
     /// through a fixed quiet period after login.
     post_auth_refreshes_pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Which kind of configuration owns a bare model id.
+enum ModelOwner {
+    Profile(crate::provider_catalog::OpenAiCompatibleProfile),
+    NamedProvider(String),
 }
 
 impl MultiProvider {
@@ -1259,6 +1315,96 @@ impl MultiProvider {
                 Ok(())
             }
         }
+    }
+
+    /// Provider names an operator could pick from, for actionable refusals.
+    fn configured_provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for profile in crate::provider_catalog::openai_compatible_profiles() {
+            if crate::provider_catalog::openai_compatible_profile_is_configured(*profile) {
+                names.push(profile.display_name.to_string());
+            }
+        }
+        for name in crate::config::config().providers.keys() {
+            names.push(name.clone());
+        }
+        names.sort();
+        names.dedup();
+        names.truncate(6);
+        names
+    }
+
+    /// Which configured provider owns a bare model id.
+    ///
+    /// Session routes are the fast path because they carry the active runtime's
+    /// own catalog, which may be fresher than the on-disk snapshot. Everything
+    /// else is answered from each provider's own catalog/config in
+    /// [`Self::catalog_owning_model`].
+    fn provider_owning_model(&self, model: &str) -> Option<ModelOwner> {
+        if let Some(profile) = self.openai_compatible_profile_owning_model(model) {
+            return Some(ModelOwner::Profile(profile));
+        }
+        self.catalog_owning_model(model)
+    }
+
+    /// Ownership from every provider's own catalog, independent of this
+    /// session's route list.
+    ///
+    /// The route list is a *view* scoped by the active provider, so a provider
+    /// the session is not using cannot answer for its ids from it, and
+    /// `[providers.<name>]` entries share the same `openai-compatible:` route
+    /// space but are not catalog profiles at all.
+    fn catalog_owning_model(&self, model: &str) -> Option<ModelOwner> {
+        let model = model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        // The active provider is preferred so re-selecting the current model
+        // never hops endpoints; otherwise declaration order decides, so the
+        // answer is deterministic when several providers serve the id.
+        if let Some(active_id) = ProviderRegistry::new(self).active_compatible_profile_id()
+            && let Some(owner) = self.owner_with_id(&active_id, model)
+        {
+            return Some(owner);
+        }
+        for profile in crate::provider_catalog::openai_compatible_profiles() {
+            if !crate::provider_catalog::openai_compatible_profile_is_configured(*profile) {
+                continue;
+            }
+            if direct_openai_compatible_profile_routes(*profile)
+                .iter()
+                .any(|route| route.model == model)
+            {
+                return Some(ModelOwner::Profile(*profile));
+            }
+        }
+        for (name, config) in &crate::config::config().providers {
+            if catalog_routes::named_provider_profile_routes(name, config)
+                .iter()
+                .any(|route| route.model == model)
+            {
+                return Some(ModelOwner::NamedProvider(name.clone()));
+            }
+        }
+        None
+    }
+
+    /// Resolve ownership for one provider id, which is either a catalog profile
+    /// id or a `[providers.<name>]` key. Sharing this check keeps the active
+    /// preference honest across both provider kinds.
+    fn owner_with_id(&self, provider_id: &str, model: &str) -> Option<ModelOwner> {
+        if let Some(profile) = crate::provider_catalog::openai_compatible_profile_by_id(provider_id)
+        {
+            return direct_openai_compatible_profile_routes(profile)
+                .iter()
+                .any(|route| route.model == model)
+                .then_some(ModelOwner::Profile(profile));
+        }
+        let config = crate::config::config().providers.get(provider_id)?;
+        catalog_routes::named_provider_profile_routes(provider_id, config)
+            .iter()
+            .any(|route| route.model == model)
+            .then(|| ModelOwner::NamedProvider(provider_id.to_string()))
     }
 
     fn set_model_on_openai_compatible_profile(
@@ -2178,6 +2324,7 @@ impl Provider for MultiProvider {
             && self
                 .active_openrouter_execution_provider()
                 .is_some_and(|provider| !provider.supports_provider_routing_features())
+            && self.provider_owning_model(requested_model).is_none()
         {
             return self.set_model_on_provider(ActiveProvider::OpenRouter, requested_model);
         }
@@ -2206,16 +2353,40 @@ impl Provider for MultiProvider {
             && let Some(target) = provider_from_model_key(target_provider)
         {
             self.set_model_on_provider(target, model)
-        } else if let Some(profile) = self.openai_compatible_profile_owning_model(model) {
+        } else {
             // Bare ids from an OpenAI-compatible catalog (`celeris-1`,
             // `mimo-v2.5`, ...) match none of the built-in model-name
-            // heuristics. Without this, `/model <bare-id>` fell through to
-            // whichever provider happened to be active and failed with a
-            // misleading "not supported by <active provider>" error.
-            self.set_model_on_openai_compatible_profile(profile, model)
-        } else {
-            // Unknown model - try current provider.
-            self.set_model_on_provider(self.active_provider(), model)
+            // heuristics, so ownership is answered by the providers' own
+            // catalogs instead of by whichever provider happens to be active.
+            match self.provider_owning_model(model) {
+                Some(ModelOwner::Profile(profile)) => {
+                    return self.set_model_on_openai_compatible_profile(profile, model);
+                }
+                Some(ModelOwner::NamedProvider(name)) => {
+                    return self.set_model_on_named_provider_profile(&name, model);
+                }
+                None => {
+                    // The aggregator slot is where guessing hurt: it accepted ids
+                    // that belonged to a compatible profile and turned them into
+                    // the aggregator's own "model does not exist" rejection. A
+                    // built-in provider owns its id space, so keep binding there.
+                    if self.active_provider() == ActiveProvider::OpenRouter {
+                        let configured = self.configured_provider_names();
+                        let hint = if configured.is_empty() {
+                            "No provider is configured with a model catalog.".to_string()
+                        } else {
+                            format!("Configured providers: {}.", configured.join(", "))
+                        };
+                        anyhow::bail!(
+                            "No configured provider serves the model `{}`. {} Use /model to choose \
+                             from a provider's catalog.",
+                            model,
+                            hint
+                        );
+                    }
+                    self.set_model_on_provider(self.active_provider(), model)
+                }
+            }
         }
     }
 

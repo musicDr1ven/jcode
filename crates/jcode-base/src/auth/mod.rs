@@ -847,6 +847,13 @@ impl AuthStatus {
         crate::auth::copilot::invalidate_github_token_cache();
         crate::provider::pricing::invalidate_auth_pricing_memos();
         crate::memory_rerank::clear_failure_backoff();
+        // Credentials decide which providers are configured, so a login or
+        // logout changes what each catalog should contain. The auth generation
+        // above already makes the route memo rebuild, but a newly configured
+        // provider has no cached catalog yet and route building does not fetch;
+        // ask the catalog sweeper to refresh now rather than waiting out its
+        // interval. The sweep is a no-op when every catalog is fresh.
+        crate::provider::catalog_scheduler::sweep_stale_profile_catalogs_now();
         crate::logging::auth_event("auth_status_cache_invalidated", "all", &[]);
     }
 

@@ -186,6 +186,45 @@ pub(super) fn is_fatal_model_endpoint_error(error: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+/// Enrich a provider-side model rejection with the likely cause.
+///
+/// The provider's own compacted message stays as the evidence; when another
+/// configured provider serves the id, this names it and the `/model` spec that
+/// switches there. Every other failure class (auth, rate limit, payload size)
+/// is returned unchanged, so model advice is never attached to an unrelated
+/// error. `lookup_owner` is injected so tests can prove it is consulted only for
+/// genuine model/endpoint rejections.
+pub(super) fn enriched_model_rejection(
+    error: &str,
+    model: &str,
+    current_provider: &str,
+    lookup_owner: impl FnOnce(&str) -> Option<crate::provider::ConfiguredModelOwner>,
+) -> String {
+    let provider_message = App::compact_provider_failure(error);
+    if !is_fatal_model_endpoint_error(error) {
+        return provider_message;
+    }
+    let model = model.trim();
+    // Remote header placeholders ("connecting to server…") are not model ids,
+    // and neither is any other multi-word string.
+    if model.is_empty() || model.chars().any(char::is_whitespace) {
+        return provider_message;
+    }
+    let current = current_provider.trim();
+    match lookup_owner(model) {
+        Some(owner) if !owner.display_name.eq_ignore_ascii_case(current) => {
+            format!(
+                "{provider_message} `{model}` is served by {}; switch with `/model {}:{model}`.",
+                owner.display_name, owner.switch_prefix
+            )
+        }
+        // The active provider serves the id, so ownership is not the answer:
+        // leave the provider's own explanation alone.
+        Some(_) => provider_message,
+        None => format!("{provider_message} No configured provider lists `{model}`; check the id."),
+    }
+}
+
 pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str) -> bool {
     if !app.auto_poke_incomplete_todos || !is_non_retryable_auto_poke_error(error) {
         return false;

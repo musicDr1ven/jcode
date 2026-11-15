@@ -2246,3 +2246,495 @@ fn bare_openai_compatible_model_ids_route_to_their_profile_not_the_active_provid
         );
     });
 }
+
+// --- model attribution: a bare id is owned by whoever serves it, never guessed ---
+
+#[test]
+fn test_unowned_bare_model_is_refused_instead_of_binding_to_active_provider() {
+    // Regression: a bare id served by no configured provider used to be bound to
+    // whichever provider was active, so the failure surfaced as that provider's
+    // own "model does not exist" rejection instead of a resolution error.
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+        let runtime = test_openrouter_runtime().expect("OpenRouter runtime should initialize");
+        let provider = test_multi_provider_with_openrouter(runtime);
+        let model_before = provider.model();
+
+        let error = provider
+            .set_model("totally-unknown-bare-model-id")
+            .expect_err("an unowned bare id must not be bound to the active provider");
+
+        assert!(
+            error.to_string().contains("No configured provider serves"),
+            "unexpected error: {error}"
+        );
+        // The refusal must not move the session: no provider switch, no model change.
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(provider.model(), model_before);
+    });
+}
+
+#[test]
+fn test_routed_model_ids_still_resolve_after_the_refusal_was_added() {
+    // The refusal must not catch ids that carry routing information.
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+        let runtime = test_openrouter_runtime().expect("OpenRouter runtime should initialize");
+        let provider = test_multi_provider_with_openrouter(runtime);
+
+        provider
+            .set_model("acme/some-model")
+            .expect("a provider/model id must still resolve to OpenRouter");
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(provider.model(), "acme/some-model");
+    });
+}
+
+#[test]
+fn test_builtin_provider_is_not_subjected_to_the_catalog_refusal() {
+    // The refusal is scoped to the aggregator slot. A built-in provider owns its
+    // id space, so resolution reaches that provider's own validation instead of
+    // short-circuiting with the cross-provider error. (Bedrock issues ids no
+    // heuristic recognises, e.g. `us.anthropic.claude-opus-4-6-v1`; OpenAI's own
+    // curated-list rejection proves the provider decided, not the resolver.)
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _guard = rt.enter();
+        let provider = test_multi_provider_with_openai();
+
+        let error = provider
+            .set_model("some-opaque-vendor-id")
+            .expect_err("OpenAI validates against its own curated model list");
+
+        assert!(
+            !error.to_string().contains("No configured provider serves"),
+            "a built-in provider must not hit the catalog refusal: {error}"
+        );
+        assert!(
+            error.to_string().contains("Unsupported OpenAI model"),
+            "expected the provider's own validation to decide: {error}"
+        );
+    });
+}
+
+// --- model attribution: catalog ownership across provider kinds ---
+
+fn bare_model_test_provider(active: ActiveProvider) -> MultiProvider {
+    MultiProvider {
+        anthropic: RwLock::new(None),
+        openai: RwLock::new(None),
+        copilot_api: RwLock::new(None),
+        antigravity: RwLock::new(None),
+        gemini: RwLock::new(None),
+        cursor: RwLock::new(None),
+        bedrock: RwLock::new(None),
+        openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
+        session_id: RwLock::new(None),
+        active: RwLock::new(active),
+        startup_notices: RwLock::new(Vec::new()),
+        initial_provider: None,
+        catalog_scope: next_catalog_scope(),
+        routes_memo: std::sync::Mutex::new(None),
+        post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+fn write_test_named_provider(provider: &str, models: &[&str]) {
+    let jcode_home = std::env::var_os("JCODE_HOME").expect("test JCODE_HOME should be set");
+    let mut toml = format!(
+        "[providers.{provider}]\n\
+         type = \"openai-compatible\"\n\
+         base_url = \"https://{provider}.example.test/v1\"\n\
+         auth = \"none\"\n"
+    );
+    for model in models {
+        toml.push_str(&format!(
+            "\n[[providers.{provider}.models]]\nid = \"{model}\"\ninput = [\"text\"]\n"
+        ));
+    }
+    std::fs::write(
+        std::path::PathBuf::from(jcode_home).join("config.toml"),
+        toml,
+    )
+    .expect("write test config.toml");
+    crate::config::invalidate_config_cache();
+}
+
+#[test]
+fn bare_profile_id_owned_only_by_an_inactive_profile_never_resolves_to_the_active_endpoint() {
+    // The defect: with a direct OpenAI-compatible profile (Celeris) active, the
+    // early "custom endpoint owns opaque ids" branch bound every unprefixed id
+    // to that endpoint before ownership was consulted. A Meta-only id was then
+    // sent to Celeris, which rejected it with its own "model does not exist".
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("CELERIS_API_KEY", "test-celeris-key");
+        crate::env::set_var("META_MUSE_API_KEY", "test-meta-key");
+
+        let provider = bare_model_test_provider(ActiveProvider::OpenRouter);
+        provider
+            .set_model("celeris:celeris-1")
+            .expect("activate Celeris as the session's compatible endpoint");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "celeris:celeris-1"
+        );
+
+        provider
+            .set_model("muse-spark-1.2")
+            .expect("a Meta-only id must resolve to Meta, not the active endpoint");
+
+        assert_eq!(provider.model(), "muse-spark-1.2");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "meta-muse:muse-spark-1.2",
+            "selecting a Meta-only id must move the session to the Meta profile"
+        );
+    });
+}
+
+#[test]
+fn ambiguous_profile_id_prefers_the_active_profile() {
+    // Re-selecting the current model must never hop endpoints when two profiles
+    // serve the same id.
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("CELERIS_API_KEY", "test-celeris-key");
+        crate::env::set_var("CHUTES_API_KEY", "test-chutes-key");
+        save_test_openrouter_model_cache(
+            "celeris",
+            "https://inference.celeris.ai/celeris-1/v1",
+            &["shared-bare-id"],
+        );
+        save_test_openrouter_model_cache("chutes", "https://llm.chutes.ai/v1", &["shared-bare-id"]);
+
+        let provider = bare_model_test_provider(ActiveProvider::OpenRouter);
+        provider
+            .set_model("celeris:shared-bare-id")
+            .expect("activate Celeris");
+        assert_eq!(provider.model(), "shared-bare-id");
+
+        provider
+            .set_model("shared-bare-id")
+            .expect("re-selecting the current model must resolve");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "celeris:shared-bare-id",
+            "the active profile must win the ambiguity"
+        );
+    });
+}
+
+#[test]
+fn named_provider_owns_a_bare_id_while_another_provider_is_active() {
+    // `[providers.<name>]` entries share the `openai-compatible:` route space,
+    // which the old owner lookup could only map back to a catalog profile, so a
+    // named provider's model was treated as unowned and fell to the active
+    // provider.
+    with_clean_provider_test_env(|| {
+        write_test_named_provider("private-gateway", &["gateway-only-model"]);
+
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        provider
+            .set_model("gateway-only-model")
+            .expect("a named provider's model must resolve to that provider");
+
+        assert_eq!(provider.model(), "gateway-only-model");
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "private-gateway:gateway-only-model"
+        );
+
+        crate::config::invalidate_config_cache();
+    });
+}
+
+#[test]
+fn profile_and_named_provider_precedence_is_deterministic() {
+    // Precedence, recorded in docs/MODEL_ATTRIBUTION.md: the active provider
+    // wins; with no provider active in the compatible slot, a catalog profile
+    // wins over a named provider in declaration (name) order.
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("CHUTES_API_KEY", "test-chutes-key");
+        save_test_openrouter_model_cache(
+            "chutes",
+            "https://llm.chutes.ai/v1",
+            &["shared-with-gateway"],
+        );
+        write_test_named_provider("private-gateway", &["shared-with-gateway"]);
+
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        provider
+            .set_model("shared-with-gateway")
+            .expect("the profile must own the id when no compatible provider is active");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "chutes:shared-with-gateway"
+        );
+
+        // Selecting the named provider explicitly then re-selecting the bare id
+        // must stay on the active named provider instead of hopping back.
+        provider
+            .set_model("private-gateway:shared-with-gateway")
+            .expect("switch to the named provider");
+        provider
+            .set_model("shared-with-gateway")
+            .expect("re-select the current model");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "private-gateway:shared-with-gateway",
+            "the active named provider must win the ambiguity"
+        );
+
+        crate::config::invalidate_config_cache();
+    });
+}
+
+#[test]
+fn unowned_model_refusal_names_a_configured_provider() {
+    // Task 3.3: the refusal must be actionable in one line and name at least
+    // one configured provider, so the user knows where to look.
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+        crate::env::set_var("CELERIS_API_KEY", "test-celeris-key");
+        let runtime = test_openrouter_runtime().expect("OpenRouter runtime should initialize");
+        let provider = test_multi_provider_with_openrouter(runtime);
+
+        let error = provider
+            .set_model("no-catalog-lists-this-id")
+            .expect_err("an unowned id must be refused");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("No configured provider serves"),
+            "unexpected refusal: {text}"
+        );
+        assert!(
+            text.contains("Celeris"),
+            "the refusal must name a configured provider: {text}"
+        );
+        assert!(
+            !text.contains('\n'),
+            "the refusal must stay actionable in one line: {text}"
+        );
+    });
+}
+
+#[test]
+fn configured_model_owner_names_the_serving_provider_and_switch_prefix() {
+    // Task 5.1 data source: the rejection enrichment must name the provider and
+    // a prefix `set_model` actually accepts, or the suggestion dead-ends.
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("CHUTES_API_KEY", "test-chutes-key");
+        save_test_openrouter_model_cache(
+            "chutes",
+            "https://llm.chutes.ai/v1",
+            &["chutes-owned-id"],
+        );
+
+        let owner = crate::provider::configured_model_owner("chutes-owned-id")
+            .expect("the Chutes catalog lists the id");
+        assert_eq!(owner.display_name, "Chutes");
+        assert_eq!(owner.switch_prefix, "chutes");
+
+        assert!(
+            crate::provider::configured_model_owner("nobody-owns-this-id").is_none(),
+            "an id no configured catalog lists has no owner"
+        );
+    });
+}
+
+// --- model attribution: a mid-session login takes effect ---
+
+fn spawn_models_catalog_server(models: &[&str]) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake catalog server");
+    let addr = listener.local_addr().expect("fake catalog addr");
+    let body = serde_json::json!({
+        "data": models
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect::<Vec<_>>()
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = vec![0u8; 8192];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+#[test]
+fn login_makes_a_newly_configured_profiles_models_resolvable_without_restart() {
+    // Task 4.1/4.2: the auth generation already invalidates route memos, but a
+    // provider configured mid-session has no cached catalog yet and route
+    // building never fetches. The credential change must ask the catalog
+    // sweeper to refresh now, so the id resolves in this session.
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        rt.block_on(async {
+            jcode_provider_openrouter_runtime::reset_profile_catalog_refresh_tracker_for_tests();
+            let api_base = spawn_models_catalog_server(&["login-only-model"]);
+            crate::env::set_var("JCODE_OPENAI_COMPAT_API_BASE", &api_base);
+            assert!(
+                crate::provider::configured_model_owner("login-only-model").is_none(),
+                "nothing owns the id before the credentials exist"
+            );
+
+            // The login: credentials land, then auth-derived state is invalidated.
+            crate::env::set_var("OPENAI_COMPAT_API_KEY", "test-login-key");
+            crate::auth::AuthStatus::invalidate_cache();
+
+            let mut owner = None;
+            for _ in 0..100 {
+                owner = crate::provider::configured_model_owner("login-only-model");
+                if owner.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let owner = owner.expect(
+                "a login must refresh the new profile's catalog without waiting for the next sweep",
+            );
+            assert_eq!(owner.switch_prefix, "openai-compatible");
+
+            // Task 4.2: the running session's picker reflects the new models.
+            let provider = bare_model_test_provider(ActiveProvider::OpenRouter);
+            let routes = provider.model_routes();
+            assert!(
+                routes.iter().any(|route| {
+                    route.model == "login-only-model"
+                        && route.api_method == "openai-compatible:openai-compatible"
+                }),
+                "the picker must offer the new provider's models without a restart: {routes:?}"
+            );
+        });
+    });
+}
+
+#[test]
+fn logout_stops_resolving_a_removed_providers_ids() {
+    // Task 4.3: a logout removes credentials, so ids only that provider served
+    // must become unowned (and be refused) rather than kept alive by a stale
+    // catalog cache.
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _guard = rt.enter();
+        crate::env::set_var("CHUTES_API_KEY", "test-chutes-key");
+        save_test_openrouter_model_cache("chutes", "https://llm.chutes.ai/v1", &["chutes-gone-id"]);
+        assert!(
+            crate::provider::configured_model_owner("chutes-gone-id").is_some(),
+            "the configured profile owns its id before logout"
+        );
+
+        crate::env::remove_var("CHUTES_API_KEY");
+        crate::auth::AuthStatus::invalidate_cache();
+
+        assert!(
+            crate::provider::configured_model_owner("chutes-gone-id").is_none(),
+            "a logged-out provider's cached catalog must stop conferring ownership"
+        );
+        let provider = bare_model_test_provider(ActiveProvider::OpenRouter);
+        let error = provider
+            .set_model("chutes-gone-id")
+            .expect_err("an id owned only by a logged-out provider must be refused");
+        assert!(
+            error.to_string().contains("No configured provider serves"),
+            "unexpected error: {error}"
+        );
+    });
+}
+
+// --- model attribution: end-to-end (task 6.1) ---
+
+#[test]
+fn a_provider_configured_mid_session_serves_a_bare_id_end_to_end() {
+    // Provider A (the OpenRouter slot) is active when the session starts.
+    // Provider B appears later: config plus credentials land, auth state is
+    // invalidated, and only then does the operator select B's bare model id.
+    // That switch must reach B and the request must complete there.
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+
+        let runtime = test_openrouter_runtime().expect("OpenRouter runtime should initialize");
+        let provider = test_multi_provider_with_openrouter(runtime);
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+
+        // B "logs in" mid-session.
+        let (api_base, request_rx) = spawn_single_response_chat_server_or();
+        let jcode_home = std::env::var_os("JCODE_HOME").expect("test JCODE_HOME should be set");
+        std::fs::create_dir_all(std::path::PathBuf::from(&jcode_home))
+            .expect("create test config dir");
+        std::fs::write(
+            std::path::PathBuf::from(&jcode_home).join("config.toml"),
+            format!(
+                "[providers.provider-b]\n\
+                 type = \"openai-compatible\"\n\
+                 base_url = \"{api_base}\"\n\
+                 api_key_env = \"PROVIDER_B_API_KEY\"\n\
+                 default_model = \"b-only-model\"\n"
+            ),
+        )
+        .expect("write test config");
+        crate::config::invalidate_config_cache();
+        crate::env::set_var("PROVIDER_B_API_KEY", "test-b-key");
+        crate::auth::AuthStatus::invalidate_cache();
+
+        // A B-only bare id must switch the same session to B.
+        provider
+            .set_model("b-only-model")
+            .expect("a bare id must resolve to the provider that serves it");
+        assert_eq!(provider.model(), "b-only-model");
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "provider-b:b-only-model"
+        );
+
+        // And the request completes against B's endpoint.
+        let messages = vec![crate::message::Message {
+            role: crate::message::Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        rt.block_on(async {
+            let mut stream = provider
+                .complete(&messages, &[], "", None)
+                .await
+                .expect("the switched provider must accept the request");
+            while let Some(event) = futures::StreamExt::next(&mut stream).await {
+                event.expect("stream event should parse");
+            }
+        });
+
+        let request = request_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("capture the request sent to provider B");
+        assert!(
+            request.contains(r#""model":"b-only-model""#),
+            "the request must carry the switched model: {request}"
+        );
+
+        crate::config::invalidate_config_cache();
+    });
+}

@@ -54,9 +54,13 @@ built-in provider legitimately issues ids that no name heuristic recognises
 (`us.anthropic.claude-opus-4-6-v1`). Those ids are not "unknown"; they belong to the active provider's own
 namespace.
 
-So the refusal is scoped to the case that actually produced the defect: the OpenRouter aggregator slot, where
-a bare id belonging to a compatible profile was accepted and turned into a cross-provider rejection. Built-in
-providers keep the fallback, and the spec states this rather than pretending the rule is absolute.
+So the refusal is scoped to the case that actually produced the defect: the native OpenRouter aggregator
+slot, where a bare id belonging to a compatible profile was accepted and turned into a cross-provider
+rejection. Direct OpenAI-compatible endpoints keep the fallback too: a custom or local server may never
+publish a `/models` catalog, so refusing unlisted ids would make its local models unusable. Built-in
+providers keep their opaque space for the same reason. In all three cases ownership runs first, so an id
+another configured provider serves is claimed before any fallback, and the spec states these bounds rather
+than pretending the rule is absolute.
 
 The alternative — resolving built-in providers' opaque ids through explicit ownership too — is real work in
 `bedrock`/`copilot`/`gemini` placeholder paths for no user-visible gain.

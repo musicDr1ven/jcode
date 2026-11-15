@@ -26,20 +26,26 @@ SHALL select the serving provider. The active provider MUST NOT be assumed to se
 
 ### Requirement: An unowned id is never guessed across providers
 
-When the active provider is an aggregator or a compatible endpoint, and no configured provider's catalog
-serves a model id, resolution SHALL fail with an error naming the id rather than binding it to the active
-provider. A built-in provider MAY continue to accept ids in its own opaque space, because it owns that
-space and no catalog of another provider can claim it.
+With the native OpenRouter aggregator active, an id that no configured provider's catalog lists SHALL fail
+resolution with an error naming the id, rather than binding it to the active provider. A direct
+OpenAI-compatible endpoint and a built-in provider MAY accept ids in their own opaque space, because neither
+namespace is discoverable by catalog. An id served by another configured provider is always attributed to
+that provider first.
 
-#### Scenario: Unknown id under an aggregator is refused
+#### Scenario: Unknown id under the aggregator is refused
 
-- **WHEN** an id matches no configured provider's catalog and an aggregator or compatible endpoint is active
+- **WHEN** an id matches no configured provider's catalog and the native OpenRouter aggregator is active
 - **THEN** the switch fails before any request is sent, and the error names the id
 
 #### Scenario: No cross-provider rejection is produced for an unowned id
 
-- **WHEN** an unknown id is submitted with an aggregator active
+- **WHEN** an unknown id is submitted with the native OpenRouter aggregator active
 - **THEN** no model request is issued to any provider
+
+#### Scenario: A direct compatible endpoint keeps its own id space
+
+- **WHEN** a direct OpenAI-compatible endpoint is active and the id is listed by no catalog
+- **THEN** the id is accepted for that endpoint rather than refused, so local models without a catalog stay usable
 
 #### Scenario: A built-in provider keeps its own id space
 

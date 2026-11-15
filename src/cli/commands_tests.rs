@@ -1814,6 +1814,7 @@ async fn auth_test_choice_plan_discovers_model_for_local_custom_compat_endpoint(
     let _env_guard = crate::storage::lock_test_env();
     let _saved = SavedEnv::capture(&[
         "JCODE_OPENAI_COMPAT_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_DEFAULT_MODEL",

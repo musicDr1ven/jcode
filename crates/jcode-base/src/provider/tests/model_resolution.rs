@@ -2738,3 +2738,265 @@ fn a_provider_configured_mid_session_serves_a_bare_id_end_to_end() {
         crate::config::invalidate_config_cache();
     });
 }
+
+// --- Neuralwatt preset: catalog, attribution, listing, auto-detect ---
+
+fn neuralwatt_profile() -> crate::provider_catalog::OpenAiCompatibleProfile {
+    crate::provider_catalog::NEURALWATT_PROFILE
+}
+
+fn save_profile_catalog(
+    namespace: &str,
+    api_base: &str,
+    cached_at: u64,
+    models: &[(&str, Option<u64>)],
+) {
+    let jcode_home = std::env::var_os("JCODE_HOME").expect("test JCODE_HOME should be set");
+    let cache_dir = std::path::PathBuf::from(jcode_home).join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("create model cache dir");
+    let cache = jcode_provider_openrouter::DiskCache {
+        cached_at,
+        source_api_base: Some(api_base.to_string()),
+        models: models
+            .iter()
+            .map(
+                |(id, created)| jcode_provider_openrouter::ModelInfo {
+                    id: (*id).to_string(),
+                    name: String::new(),
+                    context_length: None,
+                    pricing: jcode_provider_openrouter::ModelPricing::default(),
+                    created: *created,
+                    ..Default::default()
+                },
+            )
+            .collect(),
+    };
+    let path = cache_dir.join(format!("{namespace}_models.json"));
+    std::fs::write(
+        path,
+        serde_json::to_string(&cache).expect("serialize model cache"),
+    )
+    .expect("write model cache");
+}
+
+fn now_secs() -> u64 {
+    jcode_provider_openrouter::current_unix_secs().expect("current unix time")
+}
+
+#[test]
+fn neuralwatt_catalog_is_served_from_its_own_namespace_and_labelled_neuralwatt() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        crate::env::set_var("OPENAI_COMPAT_API_KEY", "test-generic-key");
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs(),
+            &[("nw-flash", Some(0)), ("glm-5.3", Some(0))],
+        );
+        // A same-named model in another namespace must not leak in.
+        save_profile_catalog(
+            "openai-compatible",
+            "https://api.openai.com/v1",
+            now_secs(),
+            &[("generic-only-model", Some(0))],
+        );
+
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        let routes = provider.model_routes();
+        let neuralwatt_routes = routes
+            .iter()
+            .filter(|route| route.api_method == "openai-compatible:neuralwatt")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            neuralwatt_routes.len(),
+            2,
+            "Neuralwatt's catalog must come from its own namespace: {routes:?}"
+        );
+        for route in neuralwatt_routes {
+            assert_eq!(route.provider, "Neuralwatt");
+            assert!(route.available);
+        }
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.model == "generic-only-model"
+                    && route.api_method == "openai-compatible:openai-compatible"),
+            "the generic profile's catalog must stay separate"
+        );
+    });
+}
+
+#[test]
+fn neuralwatt_stale_catalog_still_serves_and_an_api_base_mismatch_invalidates_it() {
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs().saturating_sub(2 * 60 * 60),
+            &[("nw-stale-model", Some(0))],
+        );
+
+        let resolved = crate::provider_catalog::resolve_openai_compatible_profile(neuralwatt_profile());
+        let (models, stale) = crate::provider::cached_live_models_for_openai_compatible_profile(
+            &resolved,
+        )
+        .expect("a stale cache must still serve its models");
+        assert_eq!(models, vec!["nw-stale-model".to_string()]);
+        assert!(stale, "the cache must report staleness while still serving");
+
+        // Pointing the preset at a different endpoint makes the old snapshot
+        // unusable rather than silently attributing another endpoint's models.
+        crate::env::set_var("JCODE_NEURALWATT_API_BASE", "https://proxy.example.test/v1");
+        let resolved = crate::provider_catalog::resolve_openai_compatible_profile(neuralwatt_profile());
+        assert_eq!(resolved.api_base, "https://proxy.example.test/v1");
+        assert!(
+            crate::provider::cached_live_models_for_openai_compatible_profile(&resolved).is_none(),
+            "an api_base mismatch must invalidate the cached catalog"
+        );
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        assert!(
+            provider
+                .model_routes()
+                .iter()
+                .all(|route| route.api_method != "openai-compatible:neuralwatt"),
+            "a mismatched cache must not surface Neuralwatt routes"
+        );
+    });
+}
+
+#[test]
+fn neuralwatt_default_model_selection_is_deterministic_without_an_explicit_default() {
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        // Neuralwatt reports `created: 0` for every model, so ranking must fall
+        // back to the quality tier and then catalog order.
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs(),
+            &[("nw-flash", Some(0)), ("glm-5.3", Some(0)), ("qwen-3.8-27b", Some(0))],
+        );
+
+        let first = crate::provider_catalog::resolve_openai_compatible_profile(neuralwatt_profile());
+        let second = crate::provider_catalog::resolve_openai_compatible_profile(neuralwatt_profile());
+        assert_eq!(
+            first.default_model, second.default_model,
+            "default model selection must be deterministic"
+        );
+        assert_eq!(
+            first.default_model.as_deref(),
+            Some("glm-5.3"),
+            "a non-cheap model must win over the `flash` tier"
+        );
+    });
+}
+
+#[test]
+fn bare_neuralwatt_ids_resolve_to_neuralwatt_not_openrouter_or_the_generic_profile() {
+    with_clean_provider_test_env(|| {
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs(),
+            &[("mimo-v2.6-pro", Some(0)), ("glm-5.3", Some(0))],
+        );
+
+        // Another provider is active, and these ids resemble other vendors'
+        // naming, but Neuralwatt's catalog decides.
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        for model in ["mimo-v2.6-pro", "glm-5.3"] {
+            provider
+                .set_model(model)
+                .unwrap_or_else(|error| panic!("{model} must resolve to Neuralwatt: {error}"));
+            assert_eq!(
+                provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+                format!("neuralwatt:{model}"),
+                "a Neuralwatt id must never fall through to another provider"
+            );
+        }
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(Provider::display_name(&provider), "Neuralwatt");
+    });
+}
+
+#[test]
+fn crossing_between_neuralwatt_and_another_profile_works_both_ways() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        crate::env::set_var("CHUTES_API_KEY", "test-chutes-key");
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs(),
+            &[("nw-switch-id", Some(0))],
+        );
+        save_profile_catalog(
+            "chutes",
+            "https://llm.chutes.ai/v1",
+            now_secs(),
+            &[("chutes-switch-id", Some(0))],
+        );
+
+        let provider = bare_model_test_provider(ActiveProvider::Claude);
+        provider
+            .set_model("chutes-switch-id")
+            .expect("start on the other profile");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "chutes:chutes-switch-id"
+        );
+
+        provider
+            .set_model("nw-switch-id")
+            .expect("switch into Neuralwatt");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "neuralwatt:nw-switch-id"
+        );
+
+        provider
+            .set_model("chutes-switch-id")
+            .expect("switch back out of Neuralwatt");
+        assert_eq!(
+            provider.fork_model_switch_request(provider.active_provider(), &provider.model()),
+            "chutes:chutes-switch-id"
+        );
+    });
+}
+
+#[test]
+fn auto_detection_selects_neuralwatt_only_as_the_single_configured_profile() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        crate::env::set_var("NEURALWATT_API_KEY", "test-neuralwatt-key");
+        save_profile_catalog(
+            "neuralwatt",
+            "https://api.neuralwatt.com/v1",
+            now_secs(),
+            &[("nw-auto-id", Some(0))],
+        );
+
+        // Only Neuralwatt configured: the shared slot auto-detects it.
+        let provider = MultiProvider::new_with_auth_status(crate::auth::AuthStatus::default());
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(Provider::display_name(&provider), "Neuralwatt");
+
+        // With a built-in provider configured too, the built-in keeps priority,
+        // so adding Neuralwatt never changes an existing default.
+        crate::env::set_var("ANTHROPIC_API_KEY", "test-anthropic-key");
+        let provider = MultiProvider::new_with_auth_status(crate::auth::AuthStatus::default());
+        assert_eq!(
+            provider.active_provider(),
+            ActiveProvider::Claude,
+            "a configured built-in provider must keep priority over a preset"
+        );
+    });
+}

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use jcode::auth::{AuthState, AuthStatus};
-use jcode::provider::Provider;
+use jcode::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
+use jcode::provider::{MultiProvider, Provider};
 use jcode::provider_catalog::{
     OPENAI_COMPAT_LOGIN_PROVIDER, login_providers, openai_compatible_profiles,
 };
@@ -35,6 +36,22 @@ fn tracked_env_vars() -> Vec<String> {
         "JCODE_OPENROUTER_API_KEY_NAME",
         "JCODE_OPENROUTER_ENV_FILE",
         "JCODE_OPENROUTER_CACHE_NAMESPACE",
+        "JCODE_NEURALWATT_API_BASE",
+        "JCODE_ANTHROPIC_API_BASE",
+        "JCODE_ANTHROPIC_API_KEY_NAME",
+        "JCODE_ANTHROPIC_ENV_FILE",
+        "JCODE_ANTHROPIC_AUTH",
+        "JCODE_ANTHROPIC_AUTH_HEADER",
+        "JCODE_ANTHROPIC_HEADERS",
+        "JCODE_ANTHROPIC_MODEL",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_RUNTIME_PROVIDER",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
         "JCODE_OPENROUTER_PROVIDER_FEATURES",
         "JCODE_OPENROUTER_ALLOW_NO_AUTH",
         "JCODE_OPENROUTER_MODEL_CATALOG",
@@ -546,5 +563,520 @@ fn login_picker_renders_openai_compatible_setup_copy() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+// --- Neuralwatt preset: endpoint override, catalog, listing, requests ---
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buf[..end]).into_owned();
+        let mut content_length = 0usize;
+        for line in headers.lines() {
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        if buf.len() >= end + 4 + content_length {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Fake Neuralwatt endpoint: every `/v1/models` request gets the catalog, and
+/// each `/v1/chat/completions` request consumes the next scripted stream. This
+/// keeps startup's background catalog refreshes from eating a scripted chat
+/// response.
+fn spawn_neuralwatt_server(chat_script: Vec<String>) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Neuralwatt server");
+    let addr = listener.local_addr().expect("fake Neuralwatt addr");
+    let (request_tx, request_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chat_index = 0usize;
+        for _ in 0..64 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let request = read_http_request(&mut stream);
+            let is_models = request.starts_with("GET /v1/models");
+            let (content_type, body) = if is_models {
+                ("application/json", neuralwatt_models_body())
+            } else {
+                let body = chat_script
+                    .get(chat_index)
+                    .cloned()
+                    .unwrap_or_else(|| neuralwatt_text_stream("done"));
+                chat_index += 1;
+                ("text/event-stream", body)
+            };
+            let _ = request_tx.send(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), request_rx)
+}
+
+/// Serve exactly one response, for surfaces that make a single request.
+fn spawn_single_response_server(
+    base_path: &str,
+    content_type: &'static str,
+    body: String,
+) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind single-response server");
+    let addr = listener.local_addr().expect("single-response addr");
+    let (request_tx, request_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let request = read_http_request(&mut stream);
+        let _ = request_tx.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    (format!("http://{addr}{base_path}"), request_rx)
+}
+
+fn neuralwatt_models_body() -> String {
+    r#"{"object":"list","data":[{"id":"nw-e2e-model","object":"model"}]}"#.to_string()
+}
+
+fn neuralwatt_tool_call_stream() -> String {
+    concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_string()
+}
+
+fn neuralwatt_text_stream(text: &str) -> String {
+    format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+fn configure_neuralwatt(api_base: &str) {
+    jcode::env::set_var("NEURALWATT_API_KEY", "sk-nw-e2e");
+    jcode::env::set_var("JCODE_NEURALWATT_API_BASE", api_base);
+    jcode::provider_catalog::apply_openai_compatible_profile_env(Some(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+    ));
+    AuthStatus::invalidate_cache();
+}
+
+fn collect_stream(
+    runtime: &dyn Provider,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Vec<StreamEvent> {
+    run_current_thread(async {
+        let mut stream = runtime
+            .complete(messages, tools, "", None)
+            .await
+            .expect("completion should start");
+        let mut events = Vec::new();
+        while let Some(event) = futures::StreamExt::next(&mut stream).await {
+            events.push(event.expect("stream event should parse"));
+        }
+        events
+    })
+}
+
+fn wait_for_request(
+    requests: &mpsc::Receiver<String>,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let request = requests
+            .recv_timeout(remaining)
+            .expect("expected a request to the fake Neuralwatt endpoint");
+        if predicate(&request) {
+            return request;
+        }
+    }
+}
+
+/// First `/v1/models` succeeds, later ones fail with 500: a refresh failure
+/// must not empty or corrupt the catalog that was already served.
+fn spawn_flaky_models_server() -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky models server");
+    let addr = listener.local_addr().expect("flaky models addr");
+    let (request_tx, request_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for attempt in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let request = read_http_request(&mut stream);
+            let _ = request_tx.send(request);
+            let response = if attempt == 0 {
+                let body = neuralwatt_models_body();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"error\":\"catalog down\"}".to_string()
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), request_rx)
+}
+
+#[test]
+fn neuralwatt_failed_refresh_keeps_the_previous_catalog() -> Result<()> {
+    let _env = TestEnv::new()?;
+    let (api_base, _requests) = spawn_flaky_models_server();
+    configure_neuralwatt(&api_base);
+    let runtime = OpenRouterProvider::new_openai_compatible_profile_runtime(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+    )?;
+    let models = run_current_thread(runtime.fetch_models())?;
+    assert!(models.iter().any(|model| model.id == "nw-e2e-model"));
+
+    let cache_path = std::path::PathBuf::from(
+        std::env::var("JCODE_HOME").expect("test JCODE_HOME should be set"),
+    )
+    .join("cache")
+    .join("neuralwatt_models.json");
+    let before = std::fs::read_to_string(&cache_path)?;
+
+    let failed = run_current_thread(runtime.refresh_models());
+    assert!(
+        failed.is_err(),
+        "the second fetch must fail against the broken endpoint"
+    );
+    let after = std::fs::read_to_string(&cache_path)?;
+    assert_eq!(
+        before, after,
+        "a failed refresh must not empty or rewrite the served catalog"
+    );
+    let cached: serde_json::Value = serde_json::from_str(&after)?;
+    assert!(
+        cached["models"]
+            .as_array()
+            .is_some_and(|models| models.iter().any(|model| model["id"] == "nw-e2e-model")),
+        "the previous catalog must remain intact: {after}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn neuralwatt_catalog_fetch_uses_the_override_endpoint_and_its_own_namespace() -> Result<()> {
+    let env = TestEnv::new()?;
+    let (api_base, requests) = spawn_neuralwatt_server(Vec::new());
+    configure_neuralwatt(&api_base);
+
+    let resolved = jcode::provider_catalog::resolve_openai_compatible_profile(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+    );
+    assert_eq!(
+        resolved.api_base, api_base,
+        "the endpoint override must apply to the catalog as well"
+    );
+
+    let runtime = OpenRouterProvider::new_openai_compatible_profile_runtime(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+    )?;
+    let models = run_current_thread(runtime.fetch_models())?;
+    assert!(
+        models.iter().any(|model| model.id == "nw-e2e-model"),
+        "the live catalog must be what the endpoint reports: {models:?}"
+    );
+
+    let request = wait_for_request(&requests, |request| request.starts_with("GET /v1/models"));
+    assert_models_request(&request);
+    assert!(
+        lower_headers(&request).contains("authorization: bearer sk-nw-e2e"),
+        "Neuralwatt's own key must authenticate the catalog request: {request}"
+    );
+    let cache_path = std::path::PathBuf::from(
+        std::env::var("JCODE_HOME").expect("test JCODE_HOME should be set"),
+    )
+    .join("cache")
+    .join("neuralwatt_models.json");
+    assert!(
+        cache_path.is_file(),
+        "the catalog must be cached under Neuralwatt's own namespace: {cache_path:?}"
+    );
+
+    let _ = env;
+    Ok(())
+}
+
+#[test]
+fn neuralwatt_models_are_listed_and_a_request_round_trips_a_tool_result() -> Result<()> {
+    let _env = TestEnv::new()?;
+    let (api_base, requests) = spawn_neuralwatt_server(vec![
+        neuralwatt_tool_call_stream(),
+        neuralwatt_text_stream("tool done"),
+    ]);
+    configure_neuralwatt(&api_base);
+
+    // Pull the live catalog first: a session constructed later loads it from
+    // Neuralwatt's namespace instead of starting from an empty catalog.
+    let runtime = OpenRouterProvider::new_openai_compatible_profile_runtime(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+    )?;
+    let models = run_current_thread(runtime.fetch_models())?;
+    assert!(models.iter().any(|model| model.id == "nw-e2e-model"));
+    let catalog_request = wait_for_request(&requests, |request| request.starts_with("GET /v1/models"));
+    assert_models_request(&catalog_request);
+
+    // Configured by name: the session runs on Neuralwatt's identity.
+    jcode::cli::startup::register_external_provider_runtimes();
+    let provider = {
+        // Startup spawns background refreshes, so construction needs a runtime
+        // context even though the test drives requests separately.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let _guard = rt.enter();
+        MultiProvider::from_auth_status(AuthStatus::default())
+    };
+    assert_eq!(Provider::display_name(&provider), "Neuralwatt");
+
+    // The picker lists the id under Neuralwatt rather than a generic provider.
+    let routes = provider.model_routes();
+    let route = routes
+        .iter()
+        .find(|route| route.model == "nw-e2e-model")
+        .unwrap_or_else(|| panic!("Neuralwatt model missing from the picker: {routes:?}"));
+    assert_eq!(route.provider, "Neuralwatt");
+    assert_eq!(route.api_method, "openai-compatible:neuralwatt");
+
+    // Selecting it starts a request to Neuralwatt's endpoint.
+    provider.set_model("nw-e2e-model")?;
+    assert_eq!(provider.model(), "nw-e2e-model");
+
+    let tools = [ToolDefinition::new(
+        "bash",
+        "run a shell command",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
+        }),
+    )];
+    let first_turn = [Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "list the directory".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let events = collect_stream(&provider, &first_turn, &tools);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolUseStart { name, .. } if name == "bash"
+        )),
+        "expected a streamed tool call, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolUseEndFor { .. })),
+        "the tool call must complete before the turn ends: {events:?}"
+    );
+
+    let chat_request = wait_for_request(&requests, |request| {
+        request.starts_with("POST /v1/chat/completions")
+    });
+    assert!(
+        chat_request.starts_with("POST /v1/chat/completions "),
+        "the request must reach Neuralwatt's chat endpoint: {chat_request}"
+    );
+    assert!(
+        chat_request.contains(r#""model":"nw-e2e-model""#),
+        "the selected model must carry the request: {chat_request}"
+    );
+    assert!(
+        lower_headers(&chat_request).contains("authorization: bearer sk-nw-e2e"),
+        "Neuralwatt's own key must authenticate the request: {chat_request}"
+    );
+
+    // The tool result goes back in the follow-up request.
+    let second_turn = [
+        first_turn[0].clone(),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "command": "echo hi" }),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "hi".to_string(),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+    let final_events = collect_stream(&provider, &second_turn, &tools);
+    assert!(
+        final_events.iter().any(
+            |event| matches!(event, StreamEvent::TextDelta(text) if text == "tool done")
+        ),
+        "the final turn should render the model's text: {final_events:?}"
+    );
+    let follow_up = wait_for_request(&requests, |request| {
+        request.starts_with("POST /v1/chat/completions")
+    });
+    assert!(
+        follow_up.contains("call_1"),
+        "the tool call id must round-trip: {follow_up}"
+    );
+    assert!(
+        follow_up.contains(r#""content":"hi""#) || follow_up.contains(r#""content": "hi""#),
+        "the tool result content must round-trip: {follow_up}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn neuralwatt_anthropic_compatible_named_profile_reaches_messages() -> Result<()> {
+    let env = TestEnv::new()?;
+    let anthropic_stream = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello from messages\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    )
+    .to_string();
+    let (api_base, requests) =
+        spawn_single_response_server("/v1", "text/event-stream", anthropic_stream);
+    let config_dir = std::path::PathBuf::from(
+        std::env::var("JCODE_HOME").expect("test JCODE_HOME should be set"),
+    );
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[providers.neuralwatt]
+type = "anthropic-compatible"
+base_url = "{api_base}"
+auth = "header"
+auth_header = "x-api-key"
+api_key_env = "NEURALWATT_API_KEY"
+default_model = "glm-5.3"
+"#
+        ),
+    )?;
+    jcode::config::invalidate_config_cache();
+    jcode::env::set_var("NEURALWATT_API_KEY", "sk-nw-anthropic");
+    let profile_name = jcode::provider_catalog::apply_named_provider_profile_env_from_config(
+        "neuralwatt",
+        &jcode::config::config(),
+    )?;
+    assert_eq!(profile_name, "neuralwatt");
+
+    let runtime = jcode_provider_anthropic_runtime::AnthropicProvider::new();
+    runtime.set_model("glm-5.3")?;
+    let messages = [Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let events = collect_stream(&runtime, &messages, &[]);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "hello from messages")),
+        "the Anthropic surface must complete: {events:?}"
+    );
+
+    let request = requests.recv_timeout(Duration::from_secs(2))?;
+    assert!(
+        request.starts_with("POST /v1/messages "),
+        "the Anthropic-compatible named profile must reach /v1/messages: {request}"
+    );
+    let headers = lower_headers(&request);
+    assert!(
+        headers.contains("x-api-key: sk-nw-anthropic"),
+        "auth_header = x-api-key must be honored: {request}"
+    );
+    assert!(
+        !headers.contains("authorization: bearer"),
+        "header auth must not also send bearer auth: {request}"
+    );
+
+    // `-p neuralwatt` is the preset (OpenAI surface); the Messages-shaped
+    // alternative lives behind `--provider-profile`, not `-p`.
+    let _ = env;
+    Ok(())
+}
+
+#[tokio::test]
+async fn neuralwatt_provider_doctor_offline_walks_its_checkpoints() -> Result<()> {
+    let _env = TestEnv::new()?;
+    let report = jcode_provider_doctor::run_provider_e2e(
+        jcode::provider_catalog::NEURALWATT_PROFILE,
+        None,
+        None,
+        jcode_provider_doctor::DoctorTier::Offline,
+    )
+    .await?;
+    assert!(
+        report.tier_passed,
+        "provider-doctor must walk Neuralwatt's offline checkpoints: {report:?}"
+    );
+    assert!(
+        !report.checks.is_empty(),
+        "offline doctor must still report checkpoints"
+    );
     Ok(())
 }

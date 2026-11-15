@@ -9,6 +9,7 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     let saved_env = [
         "JCODE_HOME",
         "JCODE_OPENAI_COMPAT_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_SETUP_URL",
@@ -155,6 +156,70 @@ fn tui_api_key_logout_clears_saved_key_and_process_env() -> anyhow::Result<()> {
             )
             .is_none()
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn tui_neuralwatt_login_writes_owner_only_binding_and_logout_clears_only_it() -> anyhow::Result<()> {
+    with_temp_jcode_home(|| {
+        let neuralwatt = save_tui_openai_compatible_key(
+            crate::provider_catalog::NEURALWATT_PROFILE,
+            " sk-nw-test-key ",
+        )?;
+        let other = save_tui_openai_compatible_key(
+            crate::provider_catalog::CHUTES_PROFILE,
+            "chutes-other-key",
+        )?;
+
+        // The login writes Neuralwatt's dedicated binding, not the generic one.
+        assert_eq!(neuralwatt.api_key_env, "NEURALWATT_API_KEY");
+        assert_eq!(neuralwatt.env_file, "neuralwatt.env");
+        assert_eq!(
+            crate::provider_catalog::load_api_key_from_env_or_config(
+                &neuralwatt.api_key_env,
+                &neuralwatt.env_file,
+            )
+            .as_deref(),
+            Some("sk-nw-test-key")
+        );
+        assert!(
+            crate::provider_catalog::load_api_key_from_env_or_config(
+                crate::provider_catalog::OPENAI_COMPAT_PROFILE.api_key_env,
+                crate::provider_catalog::OPENAI_COMPAT_PROFILE.env_file,
+            )
+            .is_none(),
+            "a Neuralwatt login must not touch the generic compatible binding"
+        );
+
+        // Credential files are owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = crate::storage::app_config_dir()?.join(&neuralwatt.env_file);
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "credential file must be owner-only: {path:?}");
+        }
+
+        // Logout clears only Neuralwatt's binding.
+        App::clear_api_key_login(&neuralwatt.api_key_env, &neuralwatt.env_file)?;
+        assert!(
+            crate::provider_catalog::load_api_key_from_env_or_config(
+                &neuralwatt.api_key_env,
+                &neuralwatt.env_file,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            crate::provider_catalog::load_api_key_from_env_or_config(
+                &other.api_key_env,
+                &other.env_file,
+            )
+            .as_deref(),
+            Some("chutes-other-key"),
+            "logging out of Neuralwatt must not clear another provider"
+        );
+
         Ok(())
     })
 }

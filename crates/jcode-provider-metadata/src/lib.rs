@@ -493,6 +493,47 @@ mod tests {
     }
 
     #[test]
+    fn neuralwatt_profile_and_login_are_available_on_all_surfaces() {
+        assert_eq!(NEURALWATT_PROFILE.id, "neuralwatt");
+        assert_eq!(NEURALWATT_PROFILE.display_name, "Neuralwatt");
+        assert_eq!(NEURALWATT_PROFILE.api_base, "https://api.neuralwatt.com/v1");
+        assert_eq!(NEURALWATT_PROFILE.api_key_env, "NEURALWATT_API_KEY");
+        assert_eq!(NEURALWATT_PROFILE.env_file, "neuralwatt.env");
+        // The catalog is discovered live after login; a pinned default would
+        // go stale as the endpoint's fleet changes.
+        assert_eq!(NEURALWATT_PROFILE.default_model, None);
+        const { assert!(NEURALWATT_PROFILE.requires_api_key) };
+        assert!(openai_compatible_profiles().contains(&NEURALWATT_PROFILE));
+        for input in ["neuralwatt", "neural-watt", " NEURALWATT "] {
+            assert_eq!(resolve_login_provider(input), Some(NEURALWATT_LOGIN_PROVIDER));
+        }
+        assert_eq!(
+            resolve_login_provider_loose("Neuralwatt"),
+            Some(NEURALWATT_LOGIN_PROVIDER)
+        );
+        assert_eq!(
+            NEURALWATT_LOGIN_PROVIDER.auth_kind,
+            LoginProviderAuthKind::ApiKey
+        );
+        assert_eq!(
+            NEURALWATT_LOGIN_PROVIDER.target,
+            LoginProviderTarget::OpenAiCompatible(NEURALWATT_PROFILE)
+        );
+        for providers in [
+            cli_login_providers(),
+            tui_login_providers(),
+            server_bootstrap_login_providers(),
+            auto_init_login_providers(),
+            auth_status_login_providers(),
+        ] {
+            assert!(
+                providers.contains(&NEURALWATT_LOGIN_PROVIDER),
+                "Neuralwatt must be offered on every login surface"
+            );
+        }
+    }
+
+    #[test]
     fn minimax_profile_uses_official_openai_compatible_configuration() {
         assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
         assert_eq!(MINIMAX_PROFILE.api_key_env, "MINIMAX_API_KEY");

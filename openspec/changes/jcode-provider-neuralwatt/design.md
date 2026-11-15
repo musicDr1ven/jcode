@@ -44,7 +44,7 @@ Verified against the live endpoint and this workspace:
 
 ### D1. A preset entry is the integration; a variant is the fallback
 
-Neuralwatt enters through the preset mechanism that already backs the 45 existing named providers — the list
+Neuralwatt enters through the preset mechanism that already backs the existing named providers — the list
 `--provider` validates against, which is why a preset is what makes `-p neuralwatt` work. That is a
 provider-metadata entry plus a catalog namespace, and nothing else.
 
@@ -56,6 +56,27 @@ streaming, or pinning that the route layer refuses).
 
 Rejected — **duplicating a runtime**: forking a 7.9k–15.5k line crate to obtain a separate identity is the
 most expensive way to solve a naming problem.
+
+**Implementation evidence (task 1.3).** The preset proves sufficient. The work is exactly the wiring every
+existing preset has: a provider-metadata profile, a login descriptor, and a `ProviderChoice` entry (the
+manual `clap::ValueEnum` behind `-p` — it is not generated from the metadata list, which is why a metadata
+entry alone would not have made `-p neuralwatt` parse). No `ActiveProvider` variant, no runtime change, and
+no new transport. Auto-detection needs no new flag either: the existing "exactly one configured compatible
+profile wins the shared slot" fallback picks Neuralwatt when it is the only provider configured, and the
+built-in ordering keeps every other default unchanged when several are configured (see D5).
+
+Verification notes recorded during implementation:
+
+- **Task 6.1's "non-streaming" half is not a code path.** jcode's chat transport always sends
+  `"stream": true`; the end-to-end test therefore covers a non-streaming catalog request (`GET /v1/models`)
+  plus streaming chat with a tool call and a tool-result round-trip on the follow-up request. There is no
+  non-streaming chat completion to exercise.
+- **Task 5.3 needs no Neuralwatt-specific doctor work.** `provider-doctor` resolves any
+  `openai_compatible_profiles()` id and walks the same checkpoints, so `provider-doctor neuralwatt --tier
+  offline` works from the metadata entry; the integration test asserts the offline report passes.
+- The endpoint override (`JCODE_NEURALWATT_API_BASE`, environment or `neuralwatt.env`) is implemented in
+  profile resolution rather than in the preset, so the catalog fetch and model requests cannot disagree
+  about the endpoint, and an endpoint change invalidates the cached catalog via its recorded source URL.
 
 ### D2. OpenAI-compatible is the default surface, Anthropic-compatible is documented
 

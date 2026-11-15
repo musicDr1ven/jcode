@@ -31,6 +31,7 @@ fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
         "JCODE_OPENROUTER_MODEL",
         "JCODE_OPENROUTER_STATIC_MODELS",
         "JCODE_OPENAI_COMPAT_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_DEFAULT_MODEL",

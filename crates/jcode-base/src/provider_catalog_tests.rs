@@ -933,6 +933,7 @@ fn matrix_openai_compatible_profile_overrides_apply_when_valid() {
     let _lock = crate::storage::lock_test_env();
     let _guard = EnvGuard::save(&[
         "JCODE_OPENAI_COMPAT_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_DEFAULT_MODEL",

@@ -530,6 +530,82 @@ fn copilot_recent_token_exchange_failure_is_not_auto_usable() {
 }
 
 #[test]
+fn neuralwatt_status_uses_only_its_own_credential_binding() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let keys = [
+        "JCODE_HOME",
+        "NEURALWATT_API_KEY",
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CHUTES_API_KEY",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_OPENROUTER_ENV_FILE",
+        "JCODE_OPENROUTER_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
+    ];
+    let saved = keys
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+    for key in keys {
+        crate::env::remove_var(key);
+    }
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Unconfigured Neuralwatt reports not-configured, and its absence does not
+    // change any other provider's status.
+    AuthStatus::invalidate_cache();
+    let status = AuthStatus::check_fast();
+    assert_eq!(
+        status
+            .assessment_for_provider(crate::provider_catalog::NEURALWATT_LOGIN_PROVIDER)
+            .state,
+        AuthState::NotConfigured
+    );
+    assert_eq!(
+        status
+            .assessment_for_provider(crate::provider_catalog::CHUTES_LOGIN_PROVIDER)
+            .state,
+        AuthState::NotConfigured,
+        "an unconfigured Neuralwatt must not affect other providers"
+    );
+
+    // The generic compatible key is never consulted for Neuralwatt.
+    crate::env::set_var("OPENAI_COMPAT_API_KEY", "generic-compatible-key");
+    AuthStatus::invalidate_cache();
+    let status = AuthStatus::check_fast();
+    assert_eq!(
+        status
+            .assessment_for_provider(crate::provider_catalog::NEURALWATT_LOGIN_PROVIDER)
+            .state,
+        AuthState::NotConfigured,
+        "the generic openai-compatible key must not authenticate Neuralwatt"
+    );
+    crate::env::remove_var("OPENAI_COMPAT_API_KEY");
+
+    // Its own binding is sufficient.
+    crate::env::set_var("NEURALWATT_API_KEY", "nw-test-key");
+    AuthStatus::invalidate_cache();
+    let status = AuthStatus::check_fast();
+    let assessment =
+        status.assessment_for_provider(crate::provider_catalog::NEURALWATT_LOGIN_PROVIDER);
+    assert!(assessment.is_available());
+    assert_eq!(
+        assessment.method_detail,
+        "API key (`NEURALWATT_API_KEY`)".to_string()
+    );
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
+    AuthStatus::invalidate_cache();
+}
+
+#[test]
 fn openrouter_like_status_is_provider_specific() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().expect("create temp dir");

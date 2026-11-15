@@ -117,6 +117,8 @@ pub enum ProviderChoice {
     #[value(alias = "venice-ai", alias = "veniceai", alias = "venice.ai")]
     Venice,
     YoloAuto,
+    #[value(alias = "neural-watt")]
+    Neuralwatt,
     #[value(alias = "lm-studio")]
     Lmstudio,
     Ollama,
@@ -197,6 +199,7 @@ impl ProviderChoice {
             Self::Celeris => "celeris",
             Self::Venice => "venice",
             Self::YoloAuto => "yolo-auto",
+            Self::Neuralwatt => "neuralwatt",
             Self::Lmstudio => "lmstudio",
             Self::Ollama => "ollama",
             Self::Chutes => "chutes",
@@ -385,6 +388,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
     (
         ProviderChoice::YoloAuto,
         crate::provider_catalog::YOLO_AUTO_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::Neuralwatt,
+        crate::provider_catalog::NEURALWATT_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Lmstudio,
@@ -1691,6 +1698,7 @@ async fn init_provider_with_model_policy(
         | ProviderChoice::Celeris
         | ProviderChoice::Venice
         | ProviderChoice::YoloAuto
+        | ProviderChoice::Neuralwatt
         | ProviderChoice::Lmstudio
         | ProviderChoice::Ollama
         | ProviderChoice::Chutes

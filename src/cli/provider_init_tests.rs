@@ -88,6 +88,41 @@ fn novita_cli_aliases_select_the_builtin_profile() {
     }
 }
 
+#[test]
+fn neuralwatt_choice_parses_and_selects_its_preset() {
+    use clap::ValueEnum;
+    for input in ["neuralwatt", "neural-watt"] {
+        let choice = ProviderChoice::from_str(input, false).unwrap();
+        assert_eq!(choice, ProviderChoice::Neuralwatt);
+        assert_eq!(
+            profile_for_choice(&choice),
+            Some(provider_catalog::NEURALWATT_PROFILE)
+        );
+        assert_eq!(
+            login_provider_for_choice(&choice),
+            Some(provider_catalog::NEURALWATT_LOGIN_PROVIDER)
+        );
+    }
+    assert_eq!(ProviderChoice::Neuralwatt.as_arg_value(), "neuralwatt");
+    // A mistyped name must still fail the way the CLI reports it: an error
+    // that lists the accepted provider values (which now include neuralwatt).
+    let error = <crate::cli::args::Args as clap::Parser>::try_parse_from([
+        "jcode",
+        "-p",
+        "neuralwatt-typo",
+    ])
+    .expect_err("an unknown provider name must still fail");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("possible values"),
+        "the failure must list accepted values: {rendered}"
+    );
+    assert!(
+        rendered.contains("neuralwatt"),
+        "the accepted values must include neuralwatt: {rendered}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[expect(
     clippy::await_holding_lock,
@@ -345,6 +380,7 @@ fn test_openai_compatible_profile_overrides() {
     let _guard = lock_env();
     let keys = [
         "JCODE_OPENAI_COMPAT_API_BASE",
+        "JCODE_NEURALWATT_API_BASE",
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_DEFAULT_MODEL",

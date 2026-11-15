@@ -509,7 +509,27 @@ pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfi
     requires_api_key: true,
 };
 
-pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 45] = [
+// Neuralwatt Cloud serves an OpenAI-compatible `/v1/chat/completions` and an
+// Anthropic-compatible `/v1/messages` from the same host. This preset uses the
+// OpenAI surface, matching every other preset; `docs/PROVIDER_NEURALWATT.md`
+// documents the Anthropic-shaped `[providers.neuralwatt]` alternative.
+//
+// `default_model` stays unset on purpose: the catalog is discovered from
+// `/v1/models` after login, and `newest_released_model_for_...` ranks that
+// catalog deterministically. Pinning an id here would go stale as the
+// endpoint's fleet changes (and would be overridden once a cache exists).
+pub const NEURALWATT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "neuralwatt",
+    display_name: "Neuralwatt",
+    api_base: "https://api.neuralwatt.com/v1",
+    api_key_env: "NEURALWATT_API_KEY",
+    env_file: "neuralwatt.env",
+    setup_url: "https://docs.neuralwatt.com/quickstart",
+    default_model: None,
+    requires_api_key: true,
+};
+
+pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 46] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
@@ -552,6 +572,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 45] = [
     CELERIS_PROFILE,
     VENICE_PROFILE,
     YOLO_AUTO_PROFILE,
+    NEURALWATT_PROFILE,
     LMSTUDIO_PROFILE,
     OLLAMA_PROFILE,
     OPENAI_COMPAT_PROFILE,
@@ -1277,6 +1298,19 @@ pub const YOLO_AUTO_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescr
     order: LoginProviderSurfaceOrder::new(Some(38), Some(38), Some(38), Some(38), Some(38)),
 };
 
+pub const NEURALWATT_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "neuralwatt",
+    display_name: "Neuralwatt",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "API key",
+    aliases: &["neural-watt"],
+    menu_detail: "OpenAI-compatible Neuralwatt Cloud inference",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(NEURALWATT_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(39), Some(39), Some(39), Some(39), Some(39)),
+};
+
 pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "google",
     display_name: "Google/Gmail",
@@ -1290,7 +1324,7 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 57] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 58] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
     ANTHROPIC_API_LOGIN_PROVIDER,
@@ -1339,6 +1373,7 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 57] = [
     CELERIS_LOGIN_PROVIDER,
     VENICE_LOGIN_PROVIDER,
     YOLO_AUTO_LOGIN_PROVIDER,
+    NEURALWATT_LOGIN_PROVIDER,
     LMSTUDIO_LOGIN_PROVIDER,
     OLLAMA_LOGIN_PROVIDER,
     OPENAI_COMPAT_LOGIN_PROVIDER,

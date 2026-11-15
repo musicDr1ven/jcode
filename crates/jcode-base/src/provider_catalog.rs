@@ -9,6 +9,10 @@ use std::collections::{HashMap, HashSet};
 pub const OPENAI_COMPAT_LOCAL_ENABLED_ENV: &str = "JCODE_OPENAI_COMPAT_LOCAL_ENABLED";
 pub const MINIMAX_CHINA_API_BASE: &str = "https://api.minimaxi.com/v1";
 pub const MINIMAX_CHINA_SETUP_URL: &str = "https://platform.minimaxi.com/docs/llms.txt";
+/// Per-installation endpoint override for the Neuralwatt preset. Read from the
+/// environment or from `neuralwatt.env`, so a proxy or regional endpoint needs
+/// no code change. See `docs/PROVIDER_NEURALWATT.md`.
+pub const NEURALWATT_API_BASE_ENV: &str = "JCODE_NEURALWATT_API_BASE";
 
 mod profile_credentials;
 pub use profile_credentials::{
@@ -86,6 +90,18 @@ fn resolve_openai_compatible_profile_endpoint(
     }
 
     apply_profile_key_based_endpoint_overrides(profile, &mut resolved, api_key_hint);
+
+    // Neuralwatt Cloud is reachable directly, but an installation may front it
+    // with a proxy or pin a regional endpoint. The override lives with the
+    // credential (environment variable or `neuralwatt.env`) so it survives a
+    // login and needs no code change.
+    if profile.id == NEURALWATT_PROFILE.id
+        && let Some(base) =
+            load_env_value_from_env_or_config(NEURALWATT_API_BASE_ENV, &resolved.env_file)
+                .and_then(|base| normalize_api_base(&base))
+    {
+        resolved.api_base = base;
+    }
 
     if profile.id != OPENAI_COMPAT_PROFILE.id {
         return resolved;

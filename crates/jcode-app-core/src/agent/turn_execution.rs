@@ -95,7 +95,20 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        // `jcode run --json`/`--ndjson` and the capture API use this path, so it
+        // must fire the same turn lifecycle events as `run_once`; otherwise a
+        // plugin or hook subscribing to `turn_start`/`turn_end` sees nothing in
+        // exactly those modes.
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        self.fire_turn_start_hook("run");
+        let result = self.run_turn(false).await;
+        let outcome: Result<()> = match &result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        };
+        self.fire_turn_end_hook(&outcome, turn_started_at, start_message_index);
+        result
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)

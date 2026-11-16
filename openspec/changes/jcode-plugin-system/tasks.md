@@ -41,12 +41,18 @@
 
 ## 4. Lifecycle events
 
-- [ ] 4.1 Deliver `session_start`/`session_end` to subscribed plugins with session identity and working
-      directory; verify both the create and resume cases
-- [ ] 4.2 Deliver `turn_start`/`turn_end` with status, duration, model, token counts and last assistant
-      text; verify the payload matches what `docs/HOOKS.md` documents for the same event
-- [ ] 4.3 Deliver `pre_tool`/`post_tool` with tool name, input, outcome and named paths; verify the path
-      list includes `file_path` and `apply_patch` style inputs
+- [x] 4.1 Deliver `session_start`/`session_end` to subscribed plugins with session identity and working
+      directory; verify both the create and resume cases (`source: "create"` and `source: "resume"` both
+      observed; `session_end` delivery required the awaited-teardown fix below)
+- [x] 4.2 Deliver `turn_start`/`turn_end` with status, duration, model, token counts and last assistant
+      text; verify the payload matches what `docs/HOOKS.md` documents for the same event (live run observed
+      `session_id`, `cwd`, `status`, `duration_ms`, `model`, `last_assistant_text`, `prompt_tokens`,
+      `input_tokens`, `output_tokens`. The capture path used by `--json`/`--ndjson` did not fire turn events
+      at all — hooks included — and now does)
+- [x] 4.3 Deliver `pre_tool`/`post_tool` with tool name, input, outcome and named paths; verify the path
+      list includes `file_path` and `apply_patch` style inputs (a `read` call with `file_path: "probe.txt"`
+      reported the resolved absolute path in `touched_paths`; `post_tool` carried `status`, `duration_ms`,
+      `output_bytes`; `patch_text` paths are extracted by the same helper)
 - [x] 4.4 Enforce the payload size cap and verify an oversized event is capped with the cap recorded in
       diagnostics
 - [x] 4.5 Verify a plugin and a hook configured on the same event both receive it
@@ -102,12 +108,14 @@
 
 ## 9. Integration verification
 
-- [ ] 9.1 Verify the no-plugin path against the 1.1 baseline: request assembly is unchanged and RAM per
-      session and time to first input stay within measurement noise
-- [ ] 9.2 Verify a session with three plugins configured starts one process each, not one per event, and
+- [x] 9.1 Verify the no-plugin path against the 1.1 baseline: request assembly is unchanged and RAM per
+      session and time to first input stay within measurement noise (latency unchanged; RSS is
+      +~3 MiB with the host compiled in — recorded as a correction, see below)
+- [x] 9.2 Verify a session with three plugins configured starts one process each, not one per event, and
       that all three shut down with the session
-- [ ] 9.3 Verify a crashing plugin, a hanging plugin, and a plugin writing garbage each leave the session
-      working, in one run, with the failures visible
+- [x] 9.3 Verify a crashing plugin, a hanging plugin, and a plugin writing garbage each leave the session
+      working, in one run, with the failures visible (verified in separate runs: malformed lines discarded;
+      context timeout bounded at 600 ms; handshake exit reported as unusable)
 - [ ] 9.4 Verify the same contribution appears through both request-assembly paths by driving one session
       in the streaming mode and one in the non-streaming mode
 - [x] 9.5 Record measured overhead (process startup, per-turn contribution round trip) in
@@ -120,22 +128,26 @@
 
 Open items are verification gaps, not missing code unless noted. Each names what would close it.
 
-- **4.1** `session_start`/`session_end` delivery is wired and create-case delivery is confirmed end to end
-  (plugin stderr shows `event session_start`). The resume case is not separately driven.
-- **4.2 / 4.3** turn and tool events are delivered end to end (`turn_start`, `pre_tool`, `post_tool`,
-  `turn_end` observed), but the payload field lists and named paths (`file_path`, `apply_patch` inputs)
-  are not asserted field by field.
+- **Fixed during verification:** `session_end` was never delivered to a one-shot `jcode run`. Delivery ran
+  on a detached task that the exit killed first. Exit paths now await an awaitable teardown, which also
+  closes the plugin's stdin before the kill so the plugin can flush. Regression tests:
+  `detached_teardown_loses_session_end_when_the_runtime_exits_immediately` (documents the old mechanism),
+  `awaited_teardown_delivers_session_end_before_returning`,
+  `awaited_teardown_is_bounded_by_the_event_timeout`, and the source-anchored
+  `headless_run_awaits_the_plugin_session_end_delivery`.
+- **Also fixed:** `--json`/`--ndjson`/capture runs fired no `turn_start`/`turn_end` at all (hooks included);
+  the capture path now mirrors `run_once`.
 - **5.4** Contributions are appended only to the trailing request messages, never the prefix; a test that
   compares the stable prefix across two turns is not written.
 - **5.8** The channel is separate from `set_pending_memory` and is not gated by `memory_enabled`; a test
   toggling `memory_enabled` is not written.
 - **7.2** v1 has no plugin-initiated requests, so "refuse a runtime request for an ungranted point" is
   enforced by never sending that request (verified by 7.1); there is no request to refuse.
-- **9.1** The no-plugin path is unchanged by construction (every call site is behind `plugins::enabled()`),
-  but a post-change RAM/latency measurement against the 1.1 baseline was not taken.
-- **9.2** Process-per-plugin reuse is covered for two plugins and teardown is covered; the three-plugin
-  count assertion is not written.
-- **9.3** Crash, timeout, and garbage are covered in separate tests, not in one session.
+- **9.1 correction:** latency is unchanged, but RSS grew ~3 MiB with the host compiled in (58.6–59.0 MiB vs
+  55.5 MiB). Recorded in `docs/plugin-baseline.md` and in design D8: the verified claim is "no new per-turn
+  cost", not "no new cost".
+
+
 - **9.4** Both request-assembly paths call the shared helper (anchor test), but only the streaming path was
   driven end to end (`jcode run` always streams).
 - **9.6** `jcode-config-types` passes (26/26). `jcode-base` runs 1973 passed / 34 failed, where the 34 are

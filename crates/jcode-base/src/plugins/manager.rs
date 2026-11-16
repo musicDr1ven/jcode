@@ -657,25 +657,79 @@ pub async fn call_plugin_tool(
     Ok(result.to_string())
 }
 
-/// Emit `session_end` to subscribed plugins and tear every process down. The
-/// session entry is removed immediately so no later call can revive it.
-pub fn session_ended(session_id: &str, payload: Value) {
-    if !enabled() {
-        return;
-    }
+/// Remove a session from the registry and tombstone it, under one lock so a
+/// concurrent extension-point call cannot revive a torn-down session.
+fn take_session_host(session_id: &str) -> Option<Arc<SessionHost>> {
     runtime()
         .ended
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(session_id.to_string());
-    let host = {
-        let mut sessions = runtime()
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sessions.remove(session_id)
+    runtime()
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id)
+}
+
+/// Deliver `session_end` (bounded by the configured `event_ms`) and kill every
+/// plugin process. Delivery is awaited so a caller that is about to exit can
+/// guarantee the last event was written; see [`session_ended_async`].
+async fn teardown_host(host: Arc<SessionHost>, payload: Value) {
+    for slot in &host.slots {
+        let state = slot.state.lock().await;
+        if let SlotState::Ready(process) = &*state {
+            let observes = process.supports(PluginCapability::Observe)
+                && slot
+                    .config
+                    .capabilities
+                    .contains(&PluginCapability::Observe);
+            let mut grace = Duration::ZERO;
+            if observes {
+                let timeout = Duration::from_millis(slot.config.timeouts.event_ms.max(1));
+                let _ = process.notify("session_end", payload.clone(), timeout).await;
+                grace = timeout;
+            }
+            // The event is only in the pipe at this point. Closing stdin gives
+            // the plugin EOF so it can read the last line, flush, and exit;
+            // killing first would discard unread data. Teardown stays bounded
+            // by the same event timeout, then falls back to a hard kill.
+            process.close_input().await;
+            if grace > Duration::ZERO && process.wait_for_exit(grace).await {
+                continue;
+            }
+            process.kill().await;
+        }
+    }
+}
+
+/// Awaitable teardown: `session_end` has been written to every subscribed plugin
+/// pipe before this returns.
+///
+/// Callers that are about to exit the process **must** use this. The
+/// fire-and-forget [`session_ended`] spawns a detached task, and a process that
+/// exits immediately afterwards kills the child before that task runs, silently
+/// dropping the final event.
+pub async fn session_ended_async(session_id: &str, payload: Value) {
+    if !enabled() {
+        return;
+    }
+    let Some(host) = take_session_host(session_id) else {
+        return;
     };
-    let Some(host) = host else {
+    teardown_host(host, payload).await;
+}
+
+/// Emit `session_end` and tear every process down, without waiting.
+///
+/// Only safe for a caller that keeps its runtime alive after this returns (a
+/// long-lived daemon, or a reconnect). A process that exits — a one-shot
+/// `jcode run` — loses the event, so exit paths use [`session_ended_async`].
+pub fn session_ended(session_id: &str, payload: Value) {
+    if !enabled() {
+        return;
+    }
+    let Some(host) = take_session_host(session_id) else {
         return;
     };
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -685,23 +739,7 @@ pub fn session_ended(session_id: &str, payload: Value) {
         ));
         return;
     };
-    handle.spawn(async move {
-        for slot in &host.slots {
-            let state = slot.state.lock().await;
-            if let SlotState::Ready(process) = &*state {
-                if process.supports(PluginCapability::Observe)
-                    && slot
-                        .config
-                        .capabilities
-                        .contains(&PluginCapability::Observe)
-                {
-                    let timeout = Duration::from_millis(slot.config.timeouts.event_ms.max(1));
-                    let _ = process.notify("session_end", payload.clone(), timeout).await;
-                }
-                process.kill().await;
-            }
-        }
-    });
+    handle.spawn(teardown_host(host, payload));
 }
 
 /// Start a plugin, handshake, report, and stop it. Used by `jcode plugin list`
@@ -781,7 +819,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"type":"hello","protocol":1,"name":"shell-plugin","version":"1.0.0","capabilities":["observe","tool_events","context","tools","gate"]}'
       if [ "$MODE" = "die-after-hello" ]; then exit 0; fi
       ;;
-    *'"type":"event"'*) printf '%s\n' "$line" >> "$LOG" ;;
+    *'"type":"event"'*)
+      if [ "$MODE" = "stuck" ]; then continue; fi
+      printf '%s\n' "$line" >> "$LOG"
+      ;;
     *'"method":"context"'*)
       if [ "$MODE" = "garbage" ]; then printf '%s\n' 'not protocol json'; fi
       if [ "$MODE" = "silent" ]; then continue; fi
@@ -889,6 +930,80 @@ done
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("timed out waiting for {needle:?} in {path:?}");
+    }
+
+    /// Documents the defect the awaited path fixes: a detached teardown task is
+    /// not guaranteed to run before a one-shot process exits.
+    #[test]
+    fn detached_teardown_loses_session_end_when_the_runtime_exits_immediately() {
+        let config = TempConfig::new(&[(
+            "detached",
+            "detached",
+            "allow",
+            "\"observe\", \"context\"",
+            "",
+        )]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            // Start the process so a session host exists, and prove it is live.
+            let contributions = collect_context("ses_detached_loss", None).await;
+            assert_eq!(contributions.len(), 1, "the plugin process must be running");
+            // Exactly the headless shape: fire the event, then leave without
+            // yielding. The spawned delivery task has not been polled yet.
+            session_ended("ses_detached_loss", json!({"event": "session_end"}));
+        });
+        drop(rt);
+        std::thread::sleep(Duration::from_millis(100));
+        let log = std::fs::read_to_string(config.path("detached.log")).unwrap_or_default();
+        assert!(
+            !log.contains("session_end"),
+            "detached delivery must not be relied on for exit paths: {log:?}"
+        );
+        drop(config);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_teardown_delivers_session_end_before_returning() {
+        let config = TempConfig::new(&[(
+            "awaited",
+            "awaited",
+            "allow",
+            "\"observe\", \"context\"",
+            "",
+        )]);
+        let _ = collect_context("ses_awaited", None).await;
+        session_ended_async("ses_awaited", json!({"event": "session_end"})).await;
+        let log = std::fs::read_to_string(config.path("awaited.log")).unwrap_or_default();
+        assert!(
+            log.contains("session_end"),
+            "an awaited teardown must have written the event before returning: {log:?}"
+        );
+        drop(config);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_teardown_is_bounded_by_the_event_timeout() {
+        let config = TempConfig::new(&[(
+            "stuck",
+            "stuck",
+            "allow",
+            "\"observe\", \"context\"",
+            "[plugins.timeouts]\nevent_ms = 200\n",
+        )]);
+        // A plugin that stops reading stdin makes the write block; the event
+        // timeout must bound teardown rather than hanging the exit.
+        let _ = collect_context("ses_stuck", None).await;
+        let started = Instant::now();
+        session_ended_async("ses_stuck", json!({"event": "session_end"})).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "teardown took {:?}, above its bound",
+            started.elapsed()
+        );
+        drop(config);
     }
 
     #[tokio::test(flavor = "current_thread")]

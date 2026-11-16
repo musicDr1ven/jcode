@@ -21,6 +21,12 @@ use crate::config::{PluginCapability, PluginConfig};
 pub(crate) trait PluginTransport: Send + Sync {
     async fn write_line(&self, line: &str) -> Result<()>;
     async fn read_line(&self) -> Result<Option<String>>;
+    /// Close the plugin's stdin, giving it EOF so it can flush and exit.
+    async fn close_input(&self) {}
+    /// Wait (bounded) for the plugin to exit on its own. `true` when it did.
+    async fn wait_for_exit(&self, _timeout: Duration) -> bool {
+        false
+    }
     async fn kill(&self);
 }
 
@@ -180,6 +186,16 @@ impl PluginProcess {
         }
     }
 
+    /// Close the plugin's stdin so it sees EOF and can flush its state.
+    pub(crate) async fn close_input(&self) {
+        self.transport.close_input().await;
+    }
+
+    /// Wait, bounded, for the plugin to exit after EOF. `true` when it exited.
+    pub(crate) async fn wait_for_exit(&self, timeout: Duration) -> bool {
+        self.transport.wait_for_exit(timeout).await
+    }
+
     pub(crate) async fn kill(&self) {
         self.transport.kill().await;
     }
@@ -213,6 +229,16 @@ impl PluginTransport for ChildTransport {
             return Ok(None);
         }
         Ok(Some(line))
+    }
+
+    async fn close_input(&self) {
+        let mut stdin = self.stdin.lock().await;
+        *stdin = None;
+    }
+
+    async fn wait_for_exit(&self, timeout: Duration) -> bool {
+        let mut child = self.child.lock().await;
+        matches!(tokio::time::timeout(timeout, child.wait()).await, Ok(Ok(_)))
     }
 
     async fn kill(&self) {

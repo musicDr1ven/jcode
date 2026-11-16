@@ -14,6 +14,20 @@ receive it.
 > you trust, and grant only the capabilities you need. Text a plugin contributes
 > is labelled as untrusted input to the model.
 
+## Where the table goes
+
+The `[[plugins]]` tables live in jcode's **main config file**:
+
+| Scope | Path |
+| --- | --- |
+| Default | `~/.jcode/config.toml` |
+| With `JCODE_HOME` set | `$JCODE_HOME/config.toml` |
+
+That is the same file the `[hooks]` table uses. It is **not** the app-config
+directory: `$JCODE_HOME/config/jcode/` holds credentials and env files
+(`neuralwatt.env`, `openrouter.env`, …), not `config.toml`. `jcode plugin list`
+reads only the main config file.
+
 ## Configuration
 
 ```toml
@@ -215,6 +229,18 @@ A plugin that exits, crashes, or writes garbage is marked unusable for the rest
 of the session. It is **not restarted**, its extension points behave as if it
 were never configured, and the failure is logged. A plugin that fails to start
 is skipped with its startup error in the log.
+
+### Teardown and `session_end`
+
+On session end jcode writes `session_end` (bounded by `event_ms`), then **closes
+the plugin's stdin** so it sees EOF, and waits up to the same bound for it to
+exit before a hard kill. A plugin that wants to flush state on shutdown should
+read until EOF and exit; anything it writes after `session_end` and before EOF
+is received.
+
+A caller that is about to exit the process (`jcode run`, `--json`, `--ndjson`)
+awaits this teardown. A long-lived daemon may deliver it on a background task,
+which is safe there because the process stays alive.
 
 ## Operator commands
 

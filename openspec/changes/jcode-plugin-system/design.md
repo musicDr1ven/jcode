@@ -134,6 +134,16 @@ With no plugin configured, the turn loop must take the same path it takes today:
 contribution list, no new await, no new diagnostic. This is a review criterion, not a nicety, and it is
 measured in the verification tasks against a baseline captured before the change.
 
+**Measured outcome:** latency is unchanged. Resident memory is not: with the host compiled in and no
+plugin configured, RSS measured ~58.6–59.0 MiB against a 55.5 MiB pre-host baseline (~3 MiB). That cost is
+one-time and constant rather than per-plugin, so the claim is "no new per-turn cost", not "no new cost".
+See `docs/plugin-baseline.md`.
+
+**Teardown corollary:** a session end that a process exit follows must be *awaited*. Delivery on a
+detached task is fine for a long-lived daemon and wrong for `jcode run`, where the exit kills the child
+before the task runs and silently drops `session_end`. Exit paths call the awaitable teardown, which
+also closes the plugin's stdin before the kill so the plugin can flush.
+
 ### D9. Both turn loops get the change through one helper
 
 Request assembly is duplicated across `turn_loops.rs` and `turn_streaming_mpsc.rs`. The contribution

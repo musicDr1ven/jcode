@@ -2716,7 +2716,10 @@ async fn run_single_message_with_agent(
     // returning the original command result unchanged. This prevents a normal
     // one-shot exit from looking like a stale-PID crash on the next startup
     // (issue #988).
-    agent.mark_closed();
+    //
+    // Await the close: this process exits next, so a detached plugin
+    // `session_end` delivery would be killed before it ran.
+    agent.mark_closed_async().await;
     result
 }
 

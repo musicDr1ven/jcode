@@ -1262,6 +1262,24 @@ impl Agent {
     }
 
     fn mark_closed_with_reason(&mut self, end_reason: crate::telemetry::SessionEndReason) {
+        self.close_session_state(end_reason);
+        self.fire_session_lifecycle_hook("session_end", "close");
+    }
+
+    /// Like [`Self::mark_closed`], but guarantees a configured plugin has
+    /// received `session_end` before returning.
+    ///
+    /// Use this on any path that exits the process after closing (a one-shot
+    /// `jcode run`): the fire-and-forget variant spawns a detached delivery
+    /// task that a subsequent process exit kills before it runs.
+    pub async fn mark_closed_async(&mut self) {
+        self.close_session_state(crate::telemetry::SessionEndReason::NormalExit);
+        self.fire_session_lifecycle_hook_awaiting_plugins("session_end", "close")
+            .await;
+    }
+
+    /// State, persistence, and telemetry half of closing a session.
+    fn close_session_state(&mut self, end_reason: crate::telemetry::SessionEndReason) {
         self.finish_concurrency_tracking();
         self.persist_soft_interrupt_snapshot();
         self.session.mark_closed();
@@ -1278,31 +1296,65 @@ impl Agent {
                 end_reason,
             );
         }
-        self.fire_session_lifecycle_hook("session_end", "close");
+    }
+
+    /// Session lifecycle payload shared by the hook and plugin channels.
+    fn session_lifecycle_payload(
+        &self,
+        source: &str,
+    ) -> (String, Option<String>, serde_json::Value) {
+        let cwd = self.working_dir().map(str::to_string);
+        let mut payload = serde_json::json!({
+            "session_id": self.session.id.clone(),
+            "source": source,
+            "model": self.provider_model(),
+        });
+        if let Some(cwd) = &cwd {
+            payload["cwd"] = serde_json::json!(cwd);
+        }
+        (self.session.id.clone(), cwd, payload)
+    }
+
+    /// Deliver a session lifecycle event to plugins, awaiting delivery so a
+    /// caller that is exiting cannot lose it.
+    async fn fire_session_lifecycle_hook_awaiting_plugins(
+        &self,
+        event_name: &'static str,
+        source: &str,
+    ) {
+        if crate::plugins::enabled() {
+            let (session_id, cwd, payload) = self.session_lifecycle_payload(source);
+            if event_name == "session_start" {
+                crate::plugins::session_started(&session_id, cwd.as_deref(), payload);
+            } else {
+                crate::plugins::session_ended_async(&session_id, payload).await;
+            }
+        }
+        if crate::hooks::hook_configured(event_name) {
+            self.dispatch_session_lifecycle_hook(event_name, source);
+        }
     }
 
     /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
     /// No-op when the hook is not configured.
     pub(crate) fn fire_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
         if crate::plugins::enabled() {
-            let cwd = self.working_dir().map(str::to_string);
-            let mut payload = serde_json::json!({
-                "session_id": self.session.id.clone(),
-                "source": source,
-                "model": self.provider_model(),
-            });
-            if let Some(cwd) = &cwd {
-                payload["cwd"] = serde_json::json!(cwd);
-            }
+            let (session_id, cwd, payload) = self.session_lifecycle_payload(source);
             if event_name == "session_start" {
-                crate::plugins::session_started(&self.session.id, cwd.as_deref(), payload);
+                crate::plugins::session_started(&session_id, cwd.as_deref(), payload);
             } else {
-                crate::plugins::session_ended(&self.session.id, payload);
+                // Daemon/reconnect callers keep their runtime alive past this
+                // point; exit paths use `mark_closed_async` instead.
+                crate::plugins::session_ended(&session_id, payload);
             }
         }
-        if !crate::hooks::hook_configured(event_name) {
-            return;
+        if crate::hooks::hook_configured(event_name) {
+            self.dispatch_session_lifecycle_hook(event_name, source);
         }
+    }
+
+    /// Observer-hook half of a session lifecycle event.
+    fn dispatch_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
         let mut event = crate::hooks::HookEvent::new(event_name)
             .session_id(self.session.id.clone())
             .field("SOURCE", source)

@@ -2331,3 +2331,26 @@ async fn one_shot_cleanup_preserves_the_original_command_error() {
         ));
     }
 }
+
+#[test]
+fn headless_run_awaits_the_plugin_session_end_delivery() {
+    // `jcode run` exits immediately after closing the session. A detached
+    // plugin teardown task would be killed before it wrote `session_end`, so
+    // this path must await the close. Source-anchored so a future refactor back
+    // to the fire-and-forget variant fails here rather than silently losing the
+    // final lifecycle event.
+    let source = include_str!("commands.rs");
+    assert!(
+        source.contains("agent.mark_closed_async().await;"),
+        "the one-shot run path must await Agent::mark_closed_async"
+    );
+    let tail = source
+        .split("async fn run_single_message_with_agent")
+        .nth(1)
+        .expect("run_single_message_with_agent exists");
+    let tail = &tail[..tail.find("\n}\n").unwrap_or(tail.len())];
+    assert!(
+        !tail.contains("agent.mark_closed();"),
+        "the one-shot run path must not use the fire-and-forget close"
+    );
+}

@@ -16,8 +16,8 @@ pub(crate) mod protocol;
 pub use manager::{
     GateDecision, GateOutcome, PluginContribution, PluginProbeReport, PluginToolSpec,
     call_plugin_tool, collect_context, emit_observe_event, emit_tool_event, enabled, gate_tool,
-    is_plugin_tool_name, plugin_tool_specs, probe_plugin, session_ended, session_started,
-    split_plugin_tool_name,
+    is_plugin_tool_name, plugin_tool_specs, probe_plugin, session_ended, session_ended_async,
+    session_started, split_plugin_tool_name,
 };
 pub use crate::config::PluginCapability;
 pub use protocol::{

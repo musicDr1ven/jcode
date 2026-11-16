@@ -21,6 +21,14 @@ no latency") is measured rather than asserted.
 | Time to first provider request | **702–818 ms** (two runs) | fake server timestamps the first `POST /v1/chat/completions` |
 | Wall time, one turn | 1.94 s | includes 1.5 s of deliberate fake-server latency |
 
+**Correction after merge (measured with the host compiled in, no plugin
+configured):** RSS is **58.6–59.0 MiB**, i.e. about **+3 MiB** over the 55.5 MiB
+pre-host baseline above. Latency was unaffected. So D8's claim holds for
+*latency* and for the per-turn path (no plugin ⇒ no await, no process), but
+"zero new cost" is wrong as stated: compiling the host in costs ~3 MiB of
+resident memory even when unused. The cost is one-time and constant, not
+per-plugin.
+
 Caveats, recorded so later runs are comparable:
 
 - This is a **headless** session, where the agent runs in-process with the
@@ -92,3 +100,41 @@ OpenAI-compatible provider (no network, no model spend). Two scenarios, each a
 | Lifecycle events delivered to the plugin | ✓ (`session_start`, `turn_start`, `pre_tool`, `post_tool`, `turn_end`) |
 | Hook and plugin on the same event both receive it | ✓ (hook log and plugin stderr both got the events) |
 | Contributed context in persisted transcript | ✗ (correct: it is request-only) |
+
+## Session teardown verification (after the `session_end` fix)
+
+A one-shot `jcode run` with an observe-only plugin used to lose `session_end`:
+the event was written inside a detached task, and the process exited (killing
+the child) before that task ran. Teardown is now awaited on exit paths and
+closes the plugin's stdin before the kill.
+
+| Scenario | Events received |
+| --- | --- |
+| `jcode run` (create) | `session_start`, `turn_start`, `turn_end`, `session_end` |
+| `jcode run --resume <id>` | `session_start` with `source: "resume"`, `turn_start`, `turn_end`, `session_end` |
+| `jcode run --json` | same as above (the capture path now fires turn events too) |
+
+`turn_end` payload fields observed: `session_id`, `cwd`, `status`,
+`duration_ms`, `model`, `last_assistant_text`, `prompt_tokens`, `input_tokens`,
+`output_tokens`.
+
+`pre_tool`/`post_tool` carry `tool_name`, `tool_input`, `tool_call_id`,
+`touched_paths`, and on completion `status`, `duration_ms`, `output_bytes`. A
+`read` call with `file_path: "probe.txt"` reported the resolved absolute path in
+`touched_paths`, confirming the `file_path` key is extracted.
+
+Tests pinning this: `detached_teardown_loses_session_end_when_the_runtime_exits_immediately`
+(documents the old mechanism), `awaited_teardown_delivers_session_end_before_returning`,
+`awaited_teardown_is_bounded_by_the_event_timeout`, and the source-anchored
+`headless_run_awaits_the_plugin_session_end_delivery`.
+
+### Known lifecycle quirk (not a plugin defect)
+
+A `--resume` one-shot run emits **two** `session_start` events for the same
+session: `source: "create"` for the placeholder agent created at startup, then
+`source: "resume"` after restore, with a `session_end` between them because the
+placeholder is closed as superseded. Hooks see the same sequence. Plugins that
+treat `session_end` as terminal should key on the session id and expect a
+following `session_start` after a supersede; the alternative — suppressing the
+placeholder's lifecycle events — changes hook and telemetry behavior and is out
+of scope here.

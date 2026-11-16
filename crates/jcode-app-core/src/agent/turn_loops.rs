@@ -3,22 +3,10 @@ use super::streaming::StreamUsageRecorder;
 use super::*;
 use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
 
-impl Agent {
-    /// Speculatively prewarm the provider while a newly created session is idle.
-    ///
-    /// This deliberately bypasses `tool_definitions`, whose cache lock is only
-    /// appropriate once an actual turn starts. Late MCP registration or user
-    /// customization can therefore still change the foreground tool snapshot;
-    /// the provider is responsible for discarding an incompatible warmup.
-    pub(crate) async fn prewarm_provider_idle(&self) {
-        self.provider.set_session_id(&self.session.id);
-        let tools = self.tool_definitions_for_debug().await;
-        let split_prompt = self.build_system_prompt_split(None);
-        self.provider
-            .prewarm(&tools, &split_prompt.static_part)
-            .await;
-    }
+#[path = "provider_prewarm.rs"]
+mod provider_prewarm;
 
+impl Agent {
     /// Run turns until no more tool calls
     /// Maximum number of context-limit compaction retries before giving up.
     pub(super) const MAX_CONTEXT_LIMIT_RETRIES: u32 = 5;
@@ -32,7 +20,8 @@ impl Agent {
     pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
-
+    const TOOL_CALLS_BEFORE_TODO_NUDGE: usize = 20;
+    const TODO_NUDGE: &str = "<system-reminder>Many tool calls have been made but this session has no todos. Use the todo tool to plan and track this task.</system-reminder>";
     fn update_sequential_tool_rounds(current: u32, tool_count: usize, used_batch: bool) -> u32 {
         if tool_count == 1 && !used_batch {
             current.saturating_add(1)
@@ -54,7 +43,8 @@ impl Agent {
     }
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.ensure_session_lease()?;
         self.set_log_context();
         let usage_turn_id = self.model_usage_turn_id();
@@ -76,8 +66,9 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
+        let mut turn_tool_calls = 0usize;
+        let mut todo_nudge_sent = false;
         let mut consecutive_malformed_tool_rounds = 0u32;
-        let mut unparsed_tool_markup_nudges = 0u32;
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -168,6 +159,16 @@ impl Agent {
                 messages_with_memory.push(Message::user(Self::BATCH_NUDGE));
                 batch_nudge_pending = false;
                 sequential_single_tool_rounds = 0;
+            }
+            if !todo_nudge_sent
+                && turn_tool_calls > Self::TOOL_CALLS_BEFORE_TODO_NUDGE
+                && tools.iter().any(|tool| tool.name == "todo")
+                && crate::todo::load_todos(&self.session.id)
+                    .map(|t| t.is_empty())
+                    .unwrap_or(false)
+            {
+                messages_with_memory.push(Message::user(Self::TODO_NUDGE));
+                todo_nudge_sent = true;
             }
             // Plugin contributions are appended after history and after
             // memory, in configured plugin order (design D2/D9). They are
@@ -629,7 +630,17 @@ impl Agent {
                             eprintln!("[trace] provider_service_tier={tier}");
                         }
                     }
+                    StreamEvent::ResolvedModel { model } => {
+                        usage_recorder.resolve_model(model);
+                    }
                     StreamEvent::RetryRollback { attempt, max } => {
+                        // Preserve reported usage from the failed attempt, but
+                        // never let its model or counters bleed into the retry.
+                        usage_recorder.finish();
+                        usage_input = None;
+                        usage_output = None;
+                        usage_cache_read = None;
+                        usage_cache_creation = None;
                         // Transient transport fault mid-stream; the provider is
                         // replaying the request. Discard this attempt's partial
                         // output so the replay doesn't duplicate it in history.
@@ -897,6 +908,16 @@ impl Agent {
                     )
                     .saturating_add(output);
                 crate::session_metrics::record_token_usage(&self.session.id, total, output);
+                if usage_input.is_some() {
+                    crate::session_telemetry::save_context(
+                        &self.session,
+                        total.saturating_sub(output),
+                        Some(self.effective_context_budget().await),
+                        self.provider.name(),
+                        self.provider.active_resolved_credential(),
+                        self.provider.serving_oauth_account_label(),
+                    );
+                }
             }
 
             if print_output
@@ -931,9 +952,6 @@ impl Agent {
                 cache_read_input_tokens: usage_cache_read,
                 cache_creation_input_tokens: usage_cache_creation,
             };
-
-            let text_tool_recovery =
-                self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
 
             let visible_text_is_empty = text_content.trim().is_empty();
 
@@ -1013,18 +1031,6 @@ impl Agent {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
-                // Unparseable tool-call markup in the text (issue #1702):
-                // surface it and ask the model to re-issue the call natively.
-                if let Some(notice) = self.maybe_nudge_unparsed_tool_markup(
-                    &text_tool_recovery,
-                    stop_reason.as_deref(),
-                    &mut unparsed_tool_markup_nudges,
-                )? {
-                    if print_output {
-                        println!("\n{}", notice);
-                    }
-                    continue;
-                }
                 if self.maybe_reconsider_fable_guardrail(
                     stop_reason.as_deref(),
                     &mut fable_guardrail_reconsiderations,
@@ -1097,6 +1103,7 @@ impl Agent {
                 logging::info("Provider handles tools internally - executing native tools locally");
             }
 
+            turn_tool_calls += tool_calls.len();
             let used_batch = tool_calls.iter().any(|tc| tc.name == "batch");
             sequential_single_tool_rounds = Self::update_sequential_tool_rounds(
                 sequential_single_tool_rounds,

@@ -1,7 +1,10 @@
+#[path = "state_ui_count_format.rs"]
+mod count_format;
 use super::state_ui_storage::infer_spawned_session_startup_hints;
 use super::*;
 use crate::tui::ui::tools_ui;
 use crate::tui::{TuiState, backend};
+use count_format::*;
 
 pub(super) struct RestoredReloadInput {
     pub input: String,
@@ -31,6 +34,45 @@ pub(super) struct RestoredReloadInput {
 }
 
 impl App {
+    /// Publish attachments immediately, without waiting for a history refresh.
+    /// The user prompt must already have been echoed into the transcript.
+    pub(super) fn publish_user_image_previews(&mut self, images: &[(String, String)]) {
+        let Some(ordinal) = self
+            .display_messages
+            .iter()
+            .filter(|message| {
+                message.effective_role() == "user"
+                    && !crate::session::is_attached_image_label_text(&message.content)
+            })
+            .count()
+            .checked_sub(1)
+        else {
+            return;
+        };
+        let anchor = Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal });
+        let previews = images
+            .iter()
+            .filter(|(media_type, data)| {
+                !media_type.is_empty()
+                    && !data.is_empty()
+                    && !self.remote_side_pane_images.iter().any(|existing| {
+                        existing.anchor == anchor
+                            && existing.media_type == *media_type
+                            && existing.data == *data
+                    })
+            })
+            .map(|(media_type, data)| crate::session::RenderedImage {
+                media_type: media_type.clone(),
+                data: data.clone(),
+                label: None,
+                source: crate::session::RenderedImageSource::UserInput,
+                anchor: anchor.clone(),
+                history_message_index: None,
+            })
+            .collect();
+        self.append_live_inline_images(previews);
+    }
+
     pub(super) fn append_live_inline_images(
         &mut self,
         images: Vec<crate::session::RenderedImage>,
@@ -145,6 +187,10 @@ impl App {
         // wrongly stuck as "unfocused idle". In that state the run loop throttles
         // repaints to ~1 Hz, so scrolling updates state but the screen only
         // repaints about once a second -- the intermittent "can't scroll" bug.
+        if !self.client_focus_confirmed {
+            self.client_focus_confirmed = true;
+            crate::tui::focus_carryover::confirm();
+        }
         if !self.client_focused {
             self.set_client_focused(true);
         }
@@ -166,19 +212,57 @@ impl App {
     /// backend here. Doing so sends an ED2 clear followed by every terminal cell on
     /// each tab switch, which makes focus changes visibly lag on large terminals.
     pub(super) fn set_client_focused(&mut self, focused: bool) -> bool {
+        // Every caller acts on a focus report or an input event.
+        if !self.client_focus_confirmed {
+            self.client_focus_confirmed = true;
+            crate::tui::focus_carryover::confirm();
+        }
         if self.client_focused == focused {
             return false;
         }
         self.client_focused = focused;
+        crate::tui::focus_carryover::record(focused);
+        crate::tui::cloud_git::note_client_focus(focused);
         if focused {
             // Schedule an immediate differential frame so a newly-focused window
             // catches up and resumes animation timing from "now".
             self.note_client_focus(true);
+            // The todo poll runs slowly while unfocused, so catch up now.
+            self.request_remote_todos_refresh_soon();
             true
         } else {
             false
         }
     }
+
+    /// Stop presuming focus that nothing has confirmed.
+    ///
+    /// A client starts out assuming it is focused, because a terminal reports
+    /// focus *changes* only and some terminals report nothing at all. A window
+    /// that started in the background, or re-executed from a build that did
+    /// not carry its focus state over, therefore stays "focused" until the
+    /// user visits it. Measured on such a window on a hidden workspace: 13
+    /// full frames and about 55 wakeups a second animating swarm spinners.
+    ///
+    /// If neither a focus report nor a single key, mouse or paste event has
+    /// arrived after [`Self::PRESUMED_FOCUS_TIMEOUT`], treat the window as
+    /// unfocused. Any later input or focus report restores it at once, and a
+    /// client that has been confirmed once is never expired, so terminals
+    /// without focus reporting keep today's behaviour after the first key.
+    /// Confirmation is carried across a re-exec, so a window the user is
+    /// only watching is not demoted two minutes after every reload.
+    pub(super) fn expire_presumed_focus(&mut self) {
+        if self.client_focus_confirmed
+            || !self.client_focused
+            || self.app_started.elapsed() < Self::PRESUMED_FOCUS_TIMEOUT
+        {
+            return;
+        }
+        self.set_client_focused(false);
+    }
+
+    pub(super) const PRESUMED_FOCUS_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(120);
 
     /// Whether a redraw is worth performing while the terminal is unfocused.
     ///
@@ -1032,89 +1116,6 @@ impl App {
     pub fn debug_socket_path() -> std::path::PathBuf {
         crate::storage::runtime_dir().join("jcode-debug.sock")
     }
-}
-
-fn cache_ratio_pct(numerator: u64, denominator: u64) -> u8 {
-    if denominator == 0 {
-        0
-    } else {
-        ((numerator as f64 / denominator as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u8
-    }
-}
-
-fn grouped_u64(value: u64) -> String {
-    let raw = value.to_string();
-    let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
-    for (index, ch) in raw.chars().enumerate() {
-        if index > 0 && (raw.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
-    grouped
-}
-
-fn trim_decimal_zeros(mut value: String) -> String {
-    if value.contains('.') {
-        while value.ends_with('0') {
-            value.pop();
-        }
-        if value.ends_with('.') {
-            value.pop();
-        }
-    }
-    value
-}
-
-fn compact_count(value: u64) -> String {
-    let Some((unit, suffix)) = [(1_000_000_000_u64, "b"), (1_000_000, "m"), (1_000, "k")]
-        .into_iter()
-        .find(|(unit, _)| value >= *unit)
-    else {
-        return value.to_string();
-    };
-
-    let scaled = value as f64 / unit as f64;
-    let decimals = if scaled >= 10.0 { 1 } else { 2 };
-    format!(
-        "{}{}",
-        trim_decimal_zeros(format!("{scaled:.decimals$}")),
-        suffix
-    )
-}
-
-fn human_count(value: u64) -> String {
-    if value < 1_000 {
-        value.to_string()
-    } else {
-        format!("{} ({})", compact_count(value), grouped_u64(value))
-    }
-}
-
-fn bold_count(value: u64) -> String {
-    human_count(value).to_string()
-}
-
-fn bold_count_usize(value: usize) -> String {
-    bold_count(value as u64)
-}
-
-fn opt_u64(value: Option<u64>) -> String {
-    value.map(human_count).unwrap_or_else(|| "None".to_string())
-}
-
-fn opt_usize(value: Option<usize>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "None".to_string())
-}
-
-fn opt_string(value: Option<&str>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "None".to_string())
 }
 
 fn push_cache_signature(

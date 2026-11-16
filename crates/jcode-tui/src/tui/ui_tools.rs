@@ -4,6 +4,63 @@ use super::{dim_color, rgb, tool_color, truncate_line_preserving_suffix_to_width
 use ratatui::prelude::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Source is a dedicated body, independent of the optional technical summary.
+/// Bound visual rows, not source lines: agents frequently submit one long line.
+pub(super) fn codemode_preview(tool: &ToolCall, width: usize) -> Vec<Line<'static>> {
+    if canonical_tool_name(&tool.name) != "codemode" {
+        return Vec::new();
+    }
+    let Some(code) = tool.input.get("code").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    if code.trim().is_empty() || width == 0 {
+        return Vec::new();
+    }
+    const MAX_ROWS: usize = 6;
+    let indent = width.saturating_sub(1).min(4);
+    let inner_width = width.saturating_sub(indent).max(1);
+    let mut rows = Vec::new();
+    let mut source = code.lines().peekable();
+    while let Some(line) = source.next() {
+        let source_line = Line::from(super::markdown::highlight_line(
+            &line.replace('\t', "    "),
+            Some("js"),
+        ));
+        let wrapped = super::markdown::wrap_lines(vec![source_line], inner_width);
+        let available = MAX_ROWS.saturating_sub(rows.len());
+        let continued = wrapped.len() > available;
+        for mut row in wrapped.into_iter().take(available) {
+            row = super::truncate_line_with_ellipsis_to_width(&row, inner_width);
+            row.spans.insert(0, Span::raw(" ".repeat(indent)));
+            rows.push(row);
+        }
+        if rows.len() == MAX_ROWS {
+            let remaining = source.count();
+            let label = if continued {
+                Some("… code continues".to_string())
+            } else if remaining > 0 {
+                Some(format!(
+                    "… {remaining} more line{}",
+                    if remaining == 1 { "" } else { "s" }
+                ))
+            } else {
+                None
+            };
+            if let Some(label) = label {
+                rows.push(super::truncate_line_with_ellipsis_to_width(
+                    &Line::from(vec![
+                        Span::raw(" ".repeat(indent)),
+                        Span::styled(label, Style::default().fg(dim_color())),
+                    ]),
+                    width,
+                ));
+            }
+            break;
+        }
+    }
+    rows
+}
+
 pub(super) use jcode_tui_tool_display::parse_tool_failure;
 pub(crate) use jcode_tui_tool_display::{
     canonical_tool_name, edit_render_name, is_edit_tool_name, resolve_display_tool_name,
@@ -127,71 +184,12 @@ pub(super) use batch::parse_batch_sub_outputs;
 pub(crate) use batch::{batch_subcall_intent, batch_subcall_params};
 pub(super) use batch::{parse_batch_completion_counts, parse_batch_sub_outputs_by_index};
 
-pub(super) fn summarize_unified_patch_input(patch_text: &str) -> String {
-    let lines = patch_text.lines().count();
-    let mut files: Vec<String> = Vec::new();
-
-    for line in patch_text.lines() {
-        let Some(rest) = line
-            .strip_prefix("--- ")
-            .or_else(|| line.strip_prefix("+++ "))
-        else {
-            continue;
-        };
-
-        let without_tab_suffix = rest.split('\t').next().unwrap_or(rest);
-        let path_token = without_tab_suffix.split_whitespace().next().unwrap_or("");
-        let path = path_token
-            .strip_prefix("a/")
-            .or(path_token.strip_prefix("b/"))
-            .unwrap_or(path_token);
-
-        if path.is_empty() || path == "/dev/null" {
-            continue;
-        }
-        if !files.iter().any(|f| f == path) {
-            files.push(path.to_string());
-        }
-    }
-
-    if files.len() == 1 {
-        format!("{} ({} lines)", files[0], lines)
-    } else if !files.is_empty() {
-        format!("{} files ({} lines)", files.len(), lines)
-    } else {
-        format!("({} lines)", lines)
-    }
-}
-
-pub(super) fn summarize_apply_patch_input(patch_text: &str) -> String {
-    let lines = patch_text.lines().count();
-    let mut files: Vec<String> = Vec::new();
-
-    for line in patch_text.lines() {
-        let trimmed = line.trim();
-        let path = trimmed
-            .strip_prefix("*** Add File: ")
-            .or_else(|| trimmed.strip_prefix("*** Update File: "))
-            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
-            .map(str::trim)
-            .unwrap_or("");
-
-        if path.is_empty() {
-            continue;
-        }
-        if !files.iter().any(|f| f == path) {
-            files.push(path.to_string());
-        }
-    }
-
-    if files.len() == 1 {
-        format!("{} ({} lines)", files[0], lines)
-    } else if !files.is_empty() {
-        format!("{} files ({} lines)", files.len(), lines)
-    } else {
-        format!("({} lines)", lines)
-    }
-}
+#[path = "ui_tools/patch_summary.rs"]
+mod patch_summary;
+pub(crate) use patch_summary::{
+    extract_apply_patch_primary_file, extract_unified_patch_primary_file,
+};
+pub(super) use patch_summary::{summarize_apply_patch_input, summarize_unified_patch_input};
 
 fn parse_agentgrep_smart_subject_relation(
     input: &serde_json::Value,
@@ -228,48 +226,6 @@ fn parse_agentgrep_smart_subject_relation(
     }
 
     (subject, relation)
-}
-
-pub(crate) fn extract_apply_patch_primary_file(patch_text: &str) -> Option<String> {
-    for line in patch_text.lines() {
-        let trimmed = line.trim();
-        let path = trimmed
-            .strip_prefix("*** Add File: ")
-            .or_else(|| trimmed.strip_prefix("*** Update File: "))
-            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
-            .map(str::trim)
-            .unwrap_or("");
-
-        if !path.is_empty() {
-            return Some(path.to_string());
-        }
-    }
-
-    None
-}
-
-pub(crate) fn extract_unified_patch_primary_file(patch_text: &str) -> Option<String> {
-    for line in patch_text.lines() {
-        let Some(rest) = line
-            .strip_prefix("+++ ")
-            .or_else(|| line.strip_prefix("--- "))
-        else {
-            continue;
-        };
-
-        let without_tab_suffix = rest.split('\t').next().unwrap_or(rest);
-        let path_token = without_tab_suffix.split_whitespace().next().unwrap_or("");
-        let path = path_token
-            .strip_prefix("a/")
-            .or(path_token.strip_prefix("b/"))
-            .unwrap_or(path_token);
-
-        if !path.is_empty() && path != "/dev/null" {
-            return Some(path.to_string());
-        }
-    }
-
-    None
 }
 
 fn display_prefix_by_width(s: &str, max_width: usize) -> &str {
@@ -831,11 +787,14 @@ fn truncate_identifier_display(value: &str, max_width: usize) -> String {
 }
 
 pub(super) fn batch_subcall_index(id: &str) -> Option<usize> {
-    id.strip_prefix("batch-")?
-        .split('-')
-        .next()?
-        .parse::<usize>()
-        .ok()
+    let index = id.strip_prefix("batch-")?.split('-').next()?;
+    match index.parse::<usize>() {
+        Ok(index) => Some(index),
+        Err(error) => {
+            crate::logging::debug(&format!("Invalid batch subcall index: {error}"));
+            None
+        }
+    }
 }
 
 pub(super) fn is_memory_store_tool(tc: &ToolCall) -> bool {

@@ -5,6 +5,8 @@
 //! root registers [`CopilotApiProvider`] with `jcode_base::provider::external`
 //! at startup.
 
+mod catalog;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -60,7 +62,62 @@ pub struct CopilotApiProvider {
     created_at: std::time::Instant,
 }
 
+// Diagnostics borrow the exact request tree that is subsequently moved to the stream.
+// Responses fingerprints instructions as a string, chat fingerprints the system message.
+fn canonical_diagnostic_parts(
+    payload: &Value,
+    responses: bool,
+) -> (&[Value], Option<&Value>, Option<&Value>) {
+    let items = payload[if responses { "input" } else { "messages" }]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let system = if responses {
+        payload.get("instructions")
+    } else {
+        items
+            .first()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+    };
+    (items, system, payload.get("tools"))
+}
+
 impl CopilotApiProvider {
+    fn canonical_payload(
+        &self,
+        model: &str,
+        responses: bool,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        system: &str,
+    ) -> Value {
+        let (mut payload, built_tools) = if responses {
+            let mut input = jcode_provider_openai::build_responses_input(messages);
+            // Copilot never declares OpenAI's hosted web_search tool.
+            jcode_provider_openai::downgrade_web_search_calls(&mut input);
+            let mut payload = json!({
+                "model": model,
+                "stream": true,
+                "max_output_tokens": 32_768u32,
+            });
+            payload["input"] = Value::Array(input);
+            if !system.is_empty() {
+                payload["instructions"] = json!(system);
+            }
+            (payload, jcode_provider_openai::build_tools(tools))
+        } else {
+            let mut payload = json!({ "model": model, "stream": true });
+            payload["messages"] = Value::Array(Self::build_messages(system, messages));
+            Self::add_max_token_parameter(&mut payload, model, 32_768u32);
+            (payload, Self::build_tools(tools))
+        };
+        self.add_reasoning_effort_parameter(&mut payload, model, responses);
+        if !built_tools.is_empty() {
+            payload["tools"] = Value::Array(built_tools);
+        }
+        payload
+    }
+
     #[cfg(test)]
     fn max_token_parameter_for_model(model: &str) -> &'static str {
         copilot_max_token_parameter_for_model(model)
@@ -101,61 +158,6 @@ impl CopilotApiProvider {
             } else {
                 body["reasoning_effort"] = json!(effort);
             }
-        }
-    }
-
-    fn persisted_catalog_path() -> Result<std::path::PathBuf> {
-        Ok(jcode_base::storage::app_config_dir()?.join("copilot_models_cache.json"))
-    }
-
-    fn load_persisted_catalog() -> Option<PersistedCatalog> {
-        let path = Self::persisted_catalog_path().ok()?;
-        jcode_base::storage::read_json(&path)
-            .ok()
-            .filter(|catalog: &PersistedCatalog| !catalog.models.is_empty())
-    }
-
-    fn persist_catalog(models: &[String]) {
-        if models.is_empty() {
-            return;
-        }
-        let Ok(path) = Self::persisted_catalog_path() else {
-            return;
-        };
-        let payload = PersistedCatalog {
-            models: models.to_vec(),
-            fetched_at_rfc3339: Utc::now().to_rfc3339(),
-        };
-        if let Err(error) = jcode_base::storage::write_json(&path, &payload) {
-            jcode_base::logging::warn(&format!(
-                "Failed to persist Copilot model catalog {}: {}",
-                path.display(),
-                error
-            ));
-        }
-    }
-
-    fn seed_cached_catalog(&self) {
-        if let Some(catalog) = Self::load_persisted_catalog() {
-            if let Ok(mut models) = self.fetched_models.try_write() {
-                *models = catalog.models;
-            }
-            if let Ok(mut source) = self.catalog_source.try_write() {
-                *source = CatalogSource::Cached;
-            }
-        }
-    }
-
-    fn model_catalog_detail_impl(&self) -> String {
-        match self
-            .catalog_source
-            .try_read()
-            .map(|g| *g)
-            .unwrap_or(CatalogSource::None)
-        {
-            CatalogSource::Live => String::new(),
-            CatalogSource::Cached => "cached live catalog".to_string(),
-            CatalogSource::None => "catalog still loading".to_string(),
         }
     }
 
@@ -316,16 +318,17 @@ impl CopilotApiProvider {
 
     /// Detect the user's Copilot tier and set the best default model.
     /// Call this after construction. Fetches a bearer token and queries /models.
-    /// If JCODE_COPILOT_MODEL is set, this is a no-op (user override).
+    /// JCODE_COPILOT_MODEL pins selection, but does not disable discovery.
     pub async fn detect_tier_and_set_default(&self) {
-        let detect_start = std::time::Instant::now();
-        if std::env::var("JCODE_COPILOT_MODEL").is_ok() {
-            jcode_base::logging::info(
-                "Copilot model overridden via JCODE_COPILOT_MODEL, skipping tier detection",
-            );
-            self.mark_init_done();
-            return;
+        if let Err(err) = self.refresh_live_catalog().await {
+            jcode_base::logging::warn(&format!("Copilot catalog refresh failed: {err:#}"));
         }
+        self.mark_init_done();
+    }
+
+    async fn refresh_live_catalog(&self) -> Result<()> {
+        let detect_start = std::time::Instant::now();
+        let model_pinned = std::env::var("JCODE_COPILOT_MODEL").is_ok();
 
         let bearer_start = std::time::Instant::now();
         let bearer = match self.get_bearer_token().await {
@@ -336,8 +339,7 @@ impl CopilotApiProvider {
                     bearer_start.elapsed().as_millis(),
                     e
                 ));
-                self.mark_init_done();
-                return;
+                return Err(e);
             }
         };
 
@@ -371,7 +373,8 @@ impl CopilotApiProvider {
                 // Only replace the placeholder default (or a model the live
                 // catalog no longer serves). A model the user or session already
                 // chose must survive the periodic tier re-detection.
-                if let Ok(mut m) = self.model.try_write()
+                if !model_pinned
+                    && let Ok(mut m) = self.model.try_write()
                     && (m.as_str() == DEFAULT_MODEL || !all_ids.iter().any(|id| id == m.as_str()))
                 {
                     *m = default;
@@ -403,9 +406,10 @@ impl CopilotApiProvider {
                     detect_start.elapsed().as_millis(),
                     e
                 ));
+                return Err(e);
             }
         }
-        self.mark_init_done();
+        Ok(())
     }
 
     fn mark_init_done(&self) {
@@ -641,7 +645,9 @@ impl CopilotApiProvider {
             };
             match stream_result {
                 Ok(()) => {
-                    let _ = attempt_guard.finish().await;
+                    // The attempt completed successfully. Only retry paths
+                    // need the replay-output flag returned by the guard.
+                    attempt_guard.finish().await;
                     return;
                 }
                 Err(e) => {
@@ -750,6 +756,7 @@ impl CopilotApiProvider {
 
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
+        let mut utf8 = jcode_base::util::Utf8StreamDecoder::new();
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
         let mut current_tool_args = String::new();
@@ -778,7 +785,7 @@ impl CopilotApiProvider {
             };
             saw_any_data = true;
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_str(&utf8.decode(&chunk));
 
             // Process complete SSE lines
             while let Some(line_end) = buffer.find('\n') {
@@ -953,57 +960,15 @@ impl Provider for CopilotApiProvider {
         }
         let model_for_fingerprint = self.model();
         let uses_responses_api = copilot_model_uses_responses_api(&model_for_fingerprint);
-        let (canonical_payload, fingerprint_input, system_value, built_tools) =
-            if uses_responses_api {
-                let mut input = jcode_provider_openai::build_responses_input(messages);
-                // Copilot never declares OpenAI's hosted web_search tool.
-                jcode_provider_openai::downgrade_web_search_calls(&mut input);
-                let tools = jcode_provider_openai::build_tools(tools);
-                let mut payload = json!({
-                    "model": &model_for_fingerprint,
-                    "input": &input,
-                    "stream": true,
-                    "max_output_tokens": 32_768u32,
-                });
-                if !system.is_empty() {
-                    payload["instructions"] = json!(system);
-                }
-                self.add_reasoning_effort_parameter(&mut payload, &model_for_fingerprint, true);
-                if !tools.is_empty() {
-                    payload["tools"] = json!(&tools);
-                }
-                (
-                    payload,
-                    input,
-                    (!system.is_empty()).then(|| json!(system)),
-                    tools,
-                )
-            } else {
-                let built_messages = Self::build_messages(system, messages);
-                let tools = Self::build_tools(tools);
-                let mut payload = json!({
-                    "model": &model_for_fingerprint,
-                    "messages": &built_messages,
-                    "stream": true,
-                });
-                Self::add_max_token_parameter(&mut payload, &model_for_fingerprint, 32_768u32);
-                self.add_reasoning_effort_parameter(&mut payload, &model_for_fingerprint, false);
-                if !tools.is_empty() {
-                    payload["tools"] = json!(&tools);
-                }
-                let system_value = built_messages
-                    .first()
-                    .filter(|message| {
-                        message.get("role").and_then(|role| role.as_str()) == Some("system")
-                    })
-                    .cloned();
-                (payload, built_messages, system_value, tools)
-            };
-        let tools_value = if built_tools.is_empty() {
-            None
-        } else {
-            Some(Value::Array(built_tools.clone()))
-        };
+        let canonical_payload = self.canonical_payload(
+            &model_for_fingerprint,
+            uses_responses_api,
+            messages,
+            tools,
+            system,
+        );
+        let (fingerprint_input, system_value, tools_value) =
+            canonical_diagnostic_parts(&canonical_payload, uses_responses_api);
         jcode_provider_core::fingerprint::log_provider_canonical_input(
             "copilot",
             &model_for_fingerprint,
@@ -1013,10 +978,10 @@ impl Provider for CopilotApiProvider {
                 "chat_completions"
             },
             &canonical_payload,
-            &fingerprint_input,
-            system_value.as_ref(),
-            tools_value.as_ref(),
-            Some(built_tools.len()),
+            fingerprint_input,
+            system_value,
+            tools_value,
+            Some(tools_value.and_then(Value::as_array).map_or(0, Vec::len)),
             &[("user_initiated", is_user_initiated.to_string())],
         );
 
@@ -1111,8 +1076,26 @@ impl Provider for CopilotApiProvider {
             ));
             return Ok(());
         }
-        self.detect_tier_and_set_default().await;
-        Ok(())
+        let result = self.refresh_live_catalog().await;
+        self.mark_init_done();
+        result
+    }
+
+    async fn refresh_model_catalog(
+        &self,
+    ) -> Result<jcode_provider_core::ModelCatalogRefreshSummary> {
+        let before_models = self.available_models_display();
+        let before_routes = self.model_routes();
+        // An explicit refresh must not be skipped by the startup grace window.
+        let result = self.refresh_live_catalog().await;
+        self.mark_init_done();
+        result?;
+        Ok(jcode_provider_core::summarize_model_catalog_refresh(
+            before_models,
+            self.available_models_display(),
+            before_routes,
+            self.model_routes(),
+        ))
     }
 
     fn supports_compaction(&self) -> bool {
@@ -1199,3 +1182,181 @@ impl Provider for CopilotApiProvider {
 #[cfg(test)]
 #[path = "copilot_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod canonical_payload_tests {
+    use super::*;
+    use jcode_provider_core::fingerprint::stable_hash_json;
+
+    fn provider() -> CopilotApiProvider {
+        CopilotApiProvider {
+            client: jcode_provider_core::shared_http_client(),
+            model: Arc::new(RwLock::new(DEFAULT_MODEL.to_string())),
+            github_token: "test-token".into(),
+            bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
+            fetched_models: Arc::new(RwLock::new(Vec::new())),
+            catalog_source: Arc::new(RwLock::new(CatalogSource::None)),
+            session_id: "test-session".into(),
+            machine_id: "test-machine".into(),
+            init_ready: Arc::new(tokio::sync::Notify::new()),
+            init_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reasoning_effort: Arc::new(RwLock::new(None)),
+            model_efforts: Arc::new(RwLock::new(Default::default())),
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    // Deliberately retain the legacy owned construction as an independent oracle.
+    fn legacy(
+        provider: &CopilotApiProvider,
+        model: &str,
+        responses: bool,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        system: &str,
+    ) -> (Value, Vec<Value>, Option<Value>, Option<Value>, usize) {
+        let (payload, input, system, tools) = if responses {
+            let mut input = jcode_provider_openai::build_responses_input(messages);
+            jcode_provider_openai::downgrade_web_search_calls(&mut input);
+            let tools = jcode_provider_openai::build_tools(tools);
+            let mut payload = json!({
+                "model": model, "input": &input, "stream": true,
+                "max_output_tokens": 32_768u32,
+            });
+            if !system.is_empty() {
+                payload["instructions"] = json!(system);
+            }
+            provider.add_reasoning_effort_parameter(&mut payload, model, true);
+            if !tools.is_empty() {
+                payload["tools"] = json!(&tools);
+            }
+            (
+                payload,
+                input,
+                (!system.is_empty()).then(|| json!(system)),
+                tools,
+            )
+        } else {
+            let input = CopilotApiProvider::build_messages(system, messages);
+            let tools = CopilotApiProvider::build_tools(tools);
+            let mut payload = json!({"model": model, "messages": &input, "stream": true});
+            CopilotApiProvider::add_max_token_parameter(&mut payload, model, 32_768u32);
+            provider.add_reasoning_effort_parameter(&mut payload, model, false);
+            if !tools.is_empty() {
+                payload["tools"] = json!(&tools);
+            }
+            let system = input
+                .first()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .cloned();
+            (payload, input, system, tools)
+        };
+        let count = tools.len();
+        let tools = (!tools.is_empty()).then(|| Value::Array(tools.clone()));
+        (payload, input, system, tools, count)
+    }
+
+    fn assert_legacy_equivalence(model: &str, responses: bool) {
+        assert_eq!(copilot_model_uses_responses_api(model), responses);
+        let provider = provider();
+        provider
+            .model_efforts
+            .write()
+            .unwrap()
+            .insert(model.into(), vec!["high".into()]);
+        let messages = [ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello 世界\n\"quoted\"".into(),
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        let populated_tools = [ToolDefinition::new(
+            "lookup",
+            "Lookup 世界",
+            json!({"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": false}),
+        )];
+        for system in ["", "System 世界\n\"quoted\""] {
+            for tools in [&[][..], &populated_tools[..]] {
+                for effort in [None, Some("high".to_string())] {
+                    *provider.reasoning_effort.write().unwrap() = effort;
+                    let (expected_payload, expected_input, expected_system, expected_tools, count) =
+                        legacy(&provider, model, responses, &messages, tools, system);
+                    let payload =
+                        provider.canonical_payload(model, responses, &messages, tools, system);
+                    let (input, diagnostic_system, diagnostic_tools) =
+                        canonical_diagnostic_parts(&payload, responses);
+                    assert_eq!(payload, expected_payload);
+                    assert_eq!(
+                        serde_json::to_vec(&payload).unwrap(),
+                        serde_json::to_vec(&expected_payload).unwrap()
+                    );
+                    assert_eq!(input, expected_input);
+                    assert_eq!(diagnostic_system, expected_system.as_ref());
+                    assert_eq!(diagnostic_tools, expected_tools.as_ref());
+                    assert_eq!(
+                        Some(
+                            diagnostic_tools
+                                .and_then(Value::as_array)
+                                .map_or(0, Vec::len)
+                        ),
+                        Some(count)
+                    );
+                    assert_eq!(
+                        stable_hash_json(&payload),
+                        stable_hash_json(&expected_payload)
+                    );
+                    assert_eq!(stable_hash_json(input), stable_hash_json(&expected_input));
+                    for (actual, expected) in [
+                        (diagnostic_system, expected_system.as_ref()),
+                        (diagnostic_tools, expected_tools.as_ref()),
+                    ] {
+                        assert_eq!(actual.map(stable_hash_json), expected.map(stable_hash_json));
+                        assert_eq!(
+                            actual.map(|v| serde_json::to_vec(v).unwrap().len()),
+                            expected.map(|v| serde_json::to_vec(v).unwrap().len())
+                        );
+                    }
+                    let items = payload[if responses { "input" } else { "messages" }]
+                        .as_array()
+                        .unwrap();
+                    assert!(std::ptr::eq(input.as_ptr(), items.as_ptr()));
+                    if let Some(system_value) = diagnostic_system {
+                        assert!(std::ptr::eq(
+                            system_value,
+                            if responses {
+                                &payload["instructions"]
+                            } else {
+                                &items[0]
+                            }
+                        ));
+                        assert_eq!(system_value.is_string(), responses);
+                    } else {
+                        assert!(system.is_empty());
+                    }
+                    if let Some(tools_value) = diagnostic_tools {
+                        assert!(std::ptr::eq(tools_value, &payload["tools"]));
+                    } else {
+                        assert!(payload.get("tools").is_none());
+                        assert_eq!(count, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_canonical_payload_matches_legacy() {
+        assert_legacy_equivalence("gpt-5.6", true);
+    }
+
+    #[test]
+    fn chat_canonical_payload_matches_legacy() {
+        assert_legacy_equivalence("gpt-4o", false);
+    }
+}

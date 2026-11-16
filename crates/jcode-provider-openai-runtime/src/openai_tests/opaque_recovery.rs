@@ -1,5 +1,5 @@
 // Public Provider::complete tests use only a loopback WS/HTTP server.
-const OPAQUE_REJECTION: &str = r#"{"type":"error","sequence_number":0,"response":null,"error":{"type":"invalid_request_error","message":"Invalid request"}}"#;
+const OPAQUE_REJECTION: &str = r#"{"type":"error","status":400,"sequence_number":0,"response":null,"error":{"type":"invalid_request_error","message":"Invalid request"}}"#;
 
 async fn opaque_recovery_public_case(
     persistent: bool,
@@ -140,7 +140,8 @@ async fn opaque_recovery_public_case(
                 summary: vec!["prior thought".into()],
                 encrypted_content: Some("encrypted-history".into()),
                 status: Some("completed".into()),
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },

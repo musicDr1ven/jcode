@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 mod display;
+mod update_policy;
+pub use update_policy::{CrossProviderFailoverMode, UpdateChannel};
 mod menubar;
 mod power;
 mod session;
 pub use session::{HibernationMode, SessionConfig};
-pub use {display::DisplayConfig, menubar::MenubarConfig, power::PowerConfig};
+pub use {
+    display::{DisplayConfig, ResumeOpenElsewhere, ResumeTimeMode},
+    menubar::MenubarConfig,
+    power::PowerConfig,
+};
 pub mod keybindings;
 mod serde_lenient;
 pub use keybindings::{
@@ -281,86 +287,6 @@ impl ReasoningDisplayMode {
     }
 }
 
-/// Update channel: how aggressively to receive updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum UpdateChannel {
-    /// Only update from tagged GitHub Releases (default).
-    #[default]
-    Stable,
-    /// Opt in to published v1.0.0-preview.N prereleases.
-    Preview,
-    /// Update from latest commit on main branch (bleeding edge).
-    Main,
-}
-
-impl UpdateChannel {
-    /// Parse a channel name, returning `None` for unknown values.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "stable" | "release" => Some(Self::Stable),
-            "preview" => Some(Self::Preview),
-            "main" | "nightly" | "edge" => Some(Self::Main),
-            _ => None,
-        }
-    }
-}
-
-/// Config deserialization is deliberately lenient: an unknown or removed
-/// channel name (e.g. a stale `update_channel = "manual"` left in
-/// config.toml) falls back to the default channel instead of failing the
-/// entire config parse. A strict enum here once made the freshly exec'd
-/// server die during the reload handoff, leaving the handoff marker stuck
-/// in `starting` and clients re-requesting the reload forever (issue #349).
-impl<'de> Deserialize<'de> for UpdateChannel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::parse(&value).unwrap_or_default())
-    }
-}
-
-impl std::fmt::Display for UpdateChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Stable => write!(f, "stable"),
-            Self::Preview => write!(f, "preview"),
-            Self::Main => write!(f, "main"),
-        }
-    }
-}
-
-/// Cross-provider failover behavior when the same input would be resent elsewhere.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CrossProviderFailoverMode {
-    /// Show a 3-second cancelable countdown, then resend on another provider.
-    #[default]
-    Countdown,
-    /// Do not resend the prompt to another provider automatically.
-    #[serde(alias = "off", alias = "false", alias = "disabled", alias = "none")]
-    Manual,
-}
-
-impl CrossProviderFailoverMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Countdown => "countdown",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "manual" | "off" | "false" | "disabled" | "none" => Some(Self::Manual),
-            "countdown" | "auto" | "automatic" => Some(Self::Countdown),
-            _ => None,
-        }
-    }
-}
-
 /// Compaction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -585,9 +511,12 @@ pub struct AgentsConfig {
     ///
     /// Leave unset (or use `"inherit"` / `"coordinator"`) to have spawned swarm
     /// agents inherit the spawning coordinator's model. Set to a concrete model
-    /// string to change the worker default. An explicit `model` in the swarm
-    /// tool overrides this default for newly spawned workers.
+    /// string to change the worker default.
     pub swarm_model: Option<String>,
+    /// Opt in to agent-selected worker models, restricted to the exact allowlist.
+    pub swarm_model_selection: bool,
+    /// Exact model/route strings the agent may request. Empty denies all overrides.
+    pub swarm_model_allowlist: Vec<String>,
     /// Reasoning effort for spawned swarm workers (`"low"`, `"medium"`,
     /// `"high"`, ...). The swarm tool does not let agents choose worker
     /// effort. Unset means `"low"`.
@@ -713,6 +642,8 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             swarm_model: None,
+            swarm_model_selection: false,
+            swarm_model_allowlist: Vec::new(),
             swarm_effort: None,
             swarm_root_effort: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
@@ -740,6 +671,30 @@ impl Default for AgentsConfig {
 }
 
 impl AgentsConfig {
+    /// Validate an agent-supplied override before resolving any provider route.
+    /// Matching is exact: a bare model never authorizes another provider's route.
+    pub fn validate_swarm_model_request(&self, model: Option<&str>) -> Result<(), &'static str> {
+        let Some(model) = model else {
+            return Ok(());
+        };
+        if !self.swarm_model_selection {
+            return Err(
+                "Agent-selected swarm models are disabled. Omit model to use the user-configured default.",
+            );
+        }
+        if model.trim().is_empty()
+            || !self
+                .swarm_model_allowlist
+                .iter()
+                .any(|allowed| allowed == model)
+        {
+            return Err(
+                "Requested swarm model is not in agents.swarm_model_allowlist. Omit model to use the user-configured default.",
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve swarm mode's root effort without allowing the orchestration
     /// sentinel to recurse into itself. Unknown values use the low-effort
     /// default without invalidating other settings.
@@ -1135,16 +1090,16 @@ pub struct AutoReviewConfig {
 /// Integration discovery configuration (legacy `[sponsors]` section name).
 ///
 /// Integration discovery makes third-party developer tools discoverable to
-/// the agent via a `discover_tools` tool backed by a hosted directory. Some
+/// the agent via an `integration_tools` tool backed by a hosted directory. Some
 /// providers may share revenue with Jcode when a referred user becomes a
 /// customer, but partnership status never influences recommendations.
 /// See <https://jcode.sh/discovery-tools>.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SponsorsConfig {
-    /// Enable integration discovery. Enabled by default; set to false to opt
-    /// out. When false, no discovery categories are added to the prompt, the
-    /// `discover_tools` tool is not registered, and jcode never contacts the
+    /// Enable integration discovery. Disabled by default; set to true to opt
+    /// in. When false, no discovery categories are added to the prompt, the
+    /// `integration_tools` tool is not registered, and jcode never contacts the
     /// discovery endpoint.
     pub enabled: bool,
     /// Base URL of the discovery endpoint.
@@ -1154,7 +1109,7 @@ pub struct SponsorsConfig {
 impl Default for SponsorsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             endpoint: "https://api.jcode.sh/v1/discovery".to_string(),
         }
     }
@@ -1351,10 +1306,14 @@ pub struct FeatureConfig {
     /// incomplete todos). `/poke on` / `/poke off` still override this per session
     /// (default: true)
     pub auto_poke: bool,
-    /// Opt in to one aggregate todo weak-point follow-up per completion cycle.
+    /// Opt in to automatic todo quality reviews: weak-point digests, confidence
+    /// validation and spike checks, ownership checks, and long-session reviews.
     /// Requires auto-poke; independent of the display-only completion report.
     /// Disabled by default for every user.
     pub todo_gate_digest: bool,
+    /// Show hypothetical disabled-gate findings in todo completion reports (default: false).
+    /// Display only: does not enable gates or follow-up turns.
+    pub todo_gate_diagnostics: bool,
     /// Inject timestamps into user messages and tool results sent to the model (default: true)
     pub message_timestamps: bool,
     /// Persist auto-recalled memory injections into normal session history instead of sending
@@ -1379,6 +1338,7 @@ impl Default for FeatureConfig {
             mermaid: true,
             auto_poke: true,
             todo_gate_digest: false,
+            todo_gate_diagnostics: false,
             message_timestamps: true,
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
@@ -1415,9 +1375,24 @@ pub struct ProviderConfig {
     pub preserve_reasoning_context: bool,
     /// How to handle cross-provider failover when the same input would be resent elsewhere.
     pub cross_provider_failover: CrossProviderFailoverMode,
+    /// Skip the cross-provider countdown for definitive exhausted usage only.
+    /// Manual cross-provider failover still disables automatic switching.
+    pub exhausted_usage_immediate_failover: bool,
+    /// Prefer bounded same-account retries for recoverable Anthropic rate limits
+    /// before rotating to another account. Long reset delays still yield.
+    pub anthropic_retry_recoverable_rate_limits: bool,
     /// Whether jcode should automatically try another account on the same provider
     /// before falling back to a different provider.
     pub same_provider_account_failover: bool,
+    /// Automatically redeem an earned OpenAI banked reset when weekly OAuth
+    /// usage is exhausted. Never purchases credits. Enabled by default.
+    pub openai_auto_banked_reset: bool,
+    /// Automatically redeem earned Anthropic Fable resets for exhausted weekly
+    /// OAuth usage. Never purchases credits. Disabled by default.
+    pub anthropic_auto_fable_reset: bool,
+    /// Preserve earned resets while the account pool router has another ready route.
+    /// Applies to both OpenAI and Anthropic automatic resets. Default: true.
+    pub auto_reset_only_when_no_routes: bool,
     /// Copilot premium request mode: "normal", "one", or "zero"
     /// "zero" means all requests are free (no premium requests consumed)
     pub copilot_premium: Option<String>,
@@ -1470,7 +1445,12 @@ impl Default for ProviderConfig {
             openai_native_compaction_threshold_tokens: 200_000,
             preserve_reasoning_context: true,
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
+            exhausted_usage_immediate_failover: true,
+            anthropic_retry_recoverable_rate_limits: true,
             same_provider_account_failover: true,
+            openai_auto_banked_reset: true,
+            anthropic_auto_fable_reset: false,
+            auto_reset_only_when_no_routes: true,
             copilot_premium: None,
             gemini_force_oauth: false,
             gemini_project: None,
@@ -1740,54 +1720,34 @@ pub struct LaunchHotkeysConfig {
 }
 
 #[cfg(test)]
-mod reasoning_display_defaults_tests {
+#[path = "reasoning_display_defaults_tests.rs"]
+mod reasoning_display_defaults_tests;
+
+#[cfg(test)]
+mod exhausted_usage_failover_tests {
     use super::*;
 
     #[test]
-    fn anthropic_effort_defaults_to_low() {
-        let config = ProviderConfig::default();
-        assert_eq!(config.anthropic_reasoning_effort.as_deref(), Some("low"));
-        let parsed: ProviderConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.anthropic_reasoning_effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn proactive_floor_defaults_and_legacy_config() {
-        let config = CompactionConfig::default();
-        assert_eq!(config.reactive_threshold, 0.80);
-        assert_eq!(config.reactive_threshold_tokens, 400_000);
-        assert_eq!(config.proactive_floor, 0.40);
-        assert_eq!(config.proactive_floor_tokens, 150_000);
-        let parsed: CompactionConfig = serde_json::from_str(r#"{"proactive_floor":0.15}"#).unwrap();
-        assert_eq!(parsed.proactive_floor, 0.15);
-        assert_eq!(parsed.proactive_floor_tokens, 150_000);
-        assert_eq!(parsed.reactive_threshold, 0.80);
-        assert_eq!(parsed.reactive_threshold_tokens, 400_000);
-    }
-
-    #[test]
-    fn explicit_reasoning_display_is_distinguishable_from_the_legacy_fallback() {
-        // Front-ends (the desktop) apply their own default only when the user
-        // has not chosen one, so this flag must not be true just because
-        // `show_thinking` happens to be set.
-        let mut display = DisplayConfig {
-            reasoning_display: None,
-            show_thinking: true,
-            ..DisplayConfig::default()
-        };
-        assert!(!display.has_explicit_reasoning_display());
-        assert_eq!(display.reasoning_display(), ReasoningDisplayMode::Full);
-
-        display.set_reasoning_display(ReasoningDisplayMode::Current);
-        assert!(display.has_explicit_reasoning_display());
-        assert_eq!(display.reasoning_display(), ReasoningDisplayMode::Current);
-        assert!(
-            display.show_thinking,
-            "any active display mode must keep reasoning requested from the provider"
+    fn exhaustion_immediate_defaults_on_and_is_independent_of_manual_mode() {
+        let defaults: ProviderConfig = serde_json::from_str("{}").unwrap();
+        assert!(defaults.exhausted_usage_immediate_failover);
+        assert!(defaults.anthropic_retry_recoverable_rate_limits);
+        let rotate: ProviderConfig =
+            serde_json::from_str(r#"{"anthropic_retry_recoverable_rate_limits":false}"#).unwrap();
+        assert!(!rotate.anthropic_retry_recoverable_rate_limits);
+        let countdown: ProviderConfig =
+            serde_json::from_str(r#"{"exhausted_usage_immediate_failover":false}"#).unwrap();
+        assert!(!countdown.exhausted_usage_immediate_failover);
+        assert_eq!(
+            countdown.cross_provider_failover,
+            CrossProviderFailoverMode::Countdown
         );
-
-        display.set_reasoning_display(ReasoningDisplayMode::Off);
-        assert!(display.has_explicit_reasoning_display());
-        assert!(!display.show_thinking);
+        let manual: ProviderConfig =
+            serde_json::from_str(r#"{"cross_provider_failover":"manual"}"#).unwrap();
+        assert!(manual.exhausted_usage_immediate_failover);
+        assert_eq!(
+            manual.cross_provider_failover,
+            CrossProviderFailoverMode::Manual
+        );
     }
 }

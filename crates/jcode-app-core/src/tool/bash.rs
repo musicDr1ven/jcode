@@ -1,9 +1,8 @@
-use super::{BACKGROUND_WAIT_GUIDANCE, StdinInputRequest, Tool, ToolContext, ToolOutput};
+use super::{BACKGROUND_WAIT_GUIDANCE, Tool, ToolContext, ToolOutput};
 use crate::background::TaskResult;
 use crate::bus::{
     BackgroundTaskProgress, BackgroundTaskProgressKind, BackgroundTaskProgressSource,
 };
-use crate::stdin_detect::{self, StdinState};
 use crate::util::truncate_str;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,12 +26,10 @@ use tokio::process::Command as TokioCommand;
 
 const MAX_OUTPUT_LEN: usize = 30000;
 const DEFAULT_TIMEOUT_MS: u64 = 120000;
-const STDIN_POLL_INTERVAL_MS: u64 = 500;
-const STDIN_INITIAL_DELAY_MS: u64 = 300;
-const STDIN_RESPONSE_TIMEOUT_MS: u64 = 1500;
 const PROGRESS_MARKER_PREFIX: &str = "JCODE_PROGRESS ";
 const CHECKPOINT_MARKER_PREFIX: &str = "JCODE_CHECKPOINT ";
-const BASH_TOOL_DESCRIPTION: &str = "Run a bash command. For repository searches, prefer agentgrep or rg over grep -r. rg skips hidden and ignored files by default, not all untracked files. Use --hidden --no-ignore when those files must be searched.";
+const BASH_TOOL_DESCRIPTION: &str =
+    "Run bash. Prefer agentgrep/rg. Include hidden/ignored with --hidden --no-ignore.";
 const WINDOWS_SHELL_TOOL_DESCRIPTION: &str =
     "Run a Windows cmd.exe command (compatibility name `bash`). Use cmd.exe syntax, not Bash.";
 
@@ -83,6 +80,17 @@ fn timeout_message(timeout_ms: u64) -> String {
         );
     }
     msg
+}
+
+/// Timeout applied to a background command.
+///
+/// An explicit timeout is honored as given. The 10 minute cap only bounds how
+/// long a foreground call may hold the turn; a background task has no such
+/// limit (and none at all when `timeout` is omitted), so clamping a requested
+/// 30 minutes down to 10 killed long test runs early with a misleading
+/// "timed out after 600000ms".
+fn background_timeout_ms(requested: Option<u64>) -> Option<u64> {
+    requested
 }
 
 fn progress_ratio_regex() -> Result<&'static regex::Regex> {
@@ -622,6 +630,39 @@ fn tool_scratch_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// Every bash command is non-interactive: stdin is /dev/null (callers that
+/// pipe stdin drop it immediately), common tools are told not to prompt, and
+/// on unix the command runs in its own session with no controlling terminal so
+/// prompts that open /dev/tty directly (sudo, ssh, git credentials) fail fast
+/// instead of hanging. The agent sees the failure and reruns non-interactively.
+const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", "true"),
+    ("SSH_ASKPASS_REQUIRE", "never"),
+    ("GCM_INTERACTIVE", "never"),
+    ("DEBIAN_FRONTEND", "noninteractive"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("SYSTEMD_PAGER", ""),
+    ("NPM_CONFIG_YES", "true"),
+    ("PIP_NO_INPUT", "1"),
+];
+
+#[cfg(not(windows))]
+fn configure_non_interactive(command: &mut TokioCommand) {
+    command.stdin(Stdio::null());
+    command.envs(NON_INTERACTIVE_ENV.iter().copied());
+    command.env_remove("SSH_ASKPASS");
+    unsafe {
+        command.pre_exec(|| {
+            // New session: no controlling tty, own process group (so group
+            // kills still work). Ignore failure if already a group leader.
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 #[cfg(not(windows))]
 fn configure_tool_scratch(command: &mut TokioCommand) {
     if let Some(dir) = tool_scratch_dir() {
@@ -677,6 +718,7 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         let mut cmd = TokioCommand::new("bash");
         cmd.arg("-c").arg(cmd_str);
         configure_tool_scratch(&mut cmd);
+        configure_non_interactive(&mut cmd);
         cmd
     }
 }
@@ -709,7 +751,9 @@ fn build_detached_shell_wrapper(command: &str) -> StdCommand {
         .arg(
             r#"eval "$JCODE_RELOAD_DETACH_COMMAND"; status=$?; printf '\n--- Command finished with exit code: %s ---\n' "$status"; exit "$status""#,
         )
-        .env("JCODE_RELOAD_DETACH_COMMAND", command);
+        .env("JCODE_RELOAD_DETACH_COMMAND", command)
+        .envs(NON_INTERACTIVE_ENV.iter().copied())
+        .env_remove("SSH_ASKPASS");
     if let Some(dir) = tool_scratch_dir() {
         cmd.env("TMPDIR", &dir).env("JCODE_SCRATCH_DIR", dir);
     }
@@ -734,89 +778,8 @@ fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
 }
 
 #[cfg(test)]
-mod utf8_truncation_tests {
-    #[cfg(any(windows, unix))]
-    use super::build_shell_command;
-    use super::format_command_output;
-
-    #[test]
-    fn format_command_output_truncates_on_utf8_boundary() {
-        let input = format!("{}é", "a".repeat(29_999));
-        let output = format_command_output(input, None);
-        assert!(output.ends_with("\n... (output truncated)"));
-        assert!(output.starts_with(&"a".repeat(29_999)));
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn build_shell_command_uses_cmd_and_executes_command() {
-        let output = build_shell_command("echo hello-from-cmd")
-            .output()
-            .await
-            .expect("run cmd command");
-        assert!(output.status.success(), "cmd command should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.to_ascii_lowercase().contains("hello-from-cmd"),
-            "unexpected stdout: {}",
-            stdout
-        );
-
-        let probe_path = std::env::temp_dir().join(format!(
-            "jcode-cmd-quoting-probe-{}.cmd",
-            std::process::id()
-        ));
-        std::fs::write(
-            &probe_path,
-            concat!(
-                "@echo off\r\n",
-                "if \"%~1\"==\"text with spaces\" if \"%~2\"==\"\" (\r\n",
-                "  echo quoted-argument-ok\r\n",
-                "  exit /b 0\r\n",
-                ")\r\n",
-                "echo first=[%~1] second=[%~2]\r\n",
-                "exit /b 1\r\n",
-            ),
-        )
-        .expect("write cmd quoting probe");
-
-        let quoted_command = format!("call \"{}\" \"text with spaces\"", probe_path.display());
-        let quoted_output = build_shell_command(&quoted_command)
-            .output()
-            .await
-            .expect("run cmd quoting probe");
-        let _ = std::fs::remove_file(&probe_path);
-        let quoted_stdout = String::from_utf8_lossy(&quoted_output.stdout);
-        let quoted_stderr = String::from_utf8_lossy(&quoted_output.stderr);
-        assert!(
-            quoted_output.status.success(),
-            "quoted argument should remain one child-process argument; stdout={quoted_stdout:?} stderr={quoted_stderr:?}"
-        );
-        assert!(
-            quoted_stdout.contains("quoted-argument-ok"),
-            "unexpected quoted-command stdout: {quoted_stdout}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn build_shell_command_uses_disk_backed_scratch_directory() {
-        // Keep JCODE_HOME stable until the final directory assertion. Running
-        // synchronously avoids holding the environment MutexGuard across await.
-        let _env_lock = crate::storage::lock_test_env();
-        let expected = super::tool_scratch_dir().expect("jcode scratch directory");
-        let output = build_shell_command("printf '%s\\n%s\\n' \"$TMPDIR\" \"$JCODE_SCRATCH_DIR\"")
-            .as_std_mut()
-            .output()
-            .expect("run bash command");
-        assert!(output.status.success(), "bash command should succeed");
-        let stdout = String::from_utf8(output.stdout).expect("utf-8 scratch paths");
-        let paths = stdout.lines().collect::<Vec<_>>();
-        let expected = expected.to_string_lossy().into_owned();
-        assert_eq!(paths, vec![expected.as_str(), expected.as_str()]);
-        assert!(std::path::Path::new(&expected).is_dir());
-    }
-}
+#[path = "bash_utf8_truncation_tests.rs"]
+mod utf8_truncation_tests;
 
 pub struct BashTool;
 
@@ -974,37 +937,8 @@ fn file_edit_hint(command: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod file_edit_hint_tests {
-    use super::file_edit_hint;
-
-    #[test]
-    fn flags_in_place_edits() {
-        for command in [
-            "sed -i 's/a/b/' src/main.rs",
-            "cd x && sed -Ei 's/a/b/g' f.rs",
-            "sed --in-place=.bak 's/a/b/' f",
-            "perl -pi -e 's/a/b/' f.rs",
-            "python3 - <<'EOF'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF",
-            "python3 -c \"import pathlib;p=pathlib.Path('f');p.write_text(p.read_text().replace('a','b'))\"",
-        ] {
-            assert!(file_edit_hint(command).is_some(), "{command}");
-        }
-    }
-
-    #[test]
-    fn ignores_read_only_commands() {
-        for command in [
-            "sed -n '1,20p' f.rs",
-            "sed 's/a/b/' f.rs",
-            "grep -i foo f.rs",
-            "cargo test -p jcode-app-core",
-            "python3 -c \"print('a'.replace('a','b'))\"",
-            "git diff --ignore-space-change",
-        ] {
-            assert!(file_edit_hint(command).is_none(), "{command}");
-        }
-    }
-}
+#[path = "bash_file_edit_hint_tests.rs"]
+mod file_edit_hint_tests;
 
 impl BashTool {
     async fn execute_foreground(
@@ -1022,26 +956,20 @@ impl BashTool {
         let timeout_ms = params.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).min(600000);
         let timeout_duration = Duration::from_millis(timeout_ms);
 
-        let has_stdin_channel = ctx.stdin_request_tx.is_some();
-
         let mut command = build_shell_command(&params.command);
         command.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
+        command.envs(crate::session_env::session_env(&ctx.session_id));
         command
             .env("JCODE_SESSION_ID", &ctx.session_id)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if has_stdin_channel {
-            command.stdin(Stdio::piped());
-        }
-
         if let Some(ref dir) = ctx.working_dir {
             command.current_dir(dir);
         }
         let mut child = command.spawn()?;
 
-        let child_pid = child.id().unwrap_or(0);
         let stdin_handle = child.stdin.take();
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -1052,8 +980,6 @@ impl BashTool {
             .intent
             .clone()
             .unwrap_or_else(|| params.command.clone());
-        let stdin_tx = ctx.stdin_request_tx.clone();
-        let tool_call_id = ctx.tool_call_id.clone();
         let title_for_work = title.clone();
         // Track progress parsed from output so a timeout promotion starts the
         // background task at the real percentage instead of 0%.
@@ -1076,86 +1002,11 @@ impl BashTool {
                     stderr_progress,
                 ));
 
-                let stdin_task = if has_stdin_channel {
-                    Some(tokio::spawn(async move {
-                        if let (Some(mut stdin_pipe), Some(stdin_tx)) = (stdin_handle, stdin_tx) {
-                            tokio::time::sleep(Duration::from_millis(STDIN_INITIAL_DELAY_MS)).await;
-
-                            let mut request_counter = 0u32;
-                            loop {
-                                #[cfg(target_os = "linux")]
-                                let state = stdin_detect::linux::check_process_tree(child_pid);
-                                #[cfg(not(target_os = "linux"))]
-                                let state = stdin_detect::is_waiting_for_stdin(child_pid);
-
-                                if state == StdinState::Reading {
-                                    request_counter += 1;
-                                    let request_id =
-                                        format!("stdin-{}-{}", tool_call_id, request_counter);
-                                    let (response_tx, response_rx) =
-                                        tokio::sync::oneshot::channel();
-
-                                    let request = StdinInputRequest {
-                                        request_id,
-                                        prompt: String::new(),
-                                        is_password: false,
-                                        response_tx,
-                                    };
-
-                                    if stdin_tx.send(request).is_err() {
-                                        break;
-                                    }
-
-                                    // Most clients cannot answer stdin prompts. Without a
-                                    // prompt reply, close stdin so commands that read it
-                                    // (e.g. `rg pattern` with no path) see EOF instead of
-                                    // hanging until the tool timeout.
-                                    match tokio::time::timeout(
-                                        Duration::from_millis(STDIN_RESPONSE_TIMEOUT_MS),
-                                        response_rx,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(input)) => {
-                                            let line = if input.ends_with('\n') {
-                                                input
-                                            } else {
-                                                format!("{}\n", input)
-                                            };
-                                            if stdin_pipe.write_all(line.as_bytes()).await.is_err()
-                                            {
-                                                break;
-                                            }
-                                            if stdin_pipe.flush().await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Ok(Err(_)) | Err(_) => {
-                                            drop(stdin_pipe);
-                                            break;
-                                        }
-                                    }
-
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                } else {
-                                    tokio::time::sleep(Duration::from_millis(
-                                        STDIN_POLL_INTERVAL_MS,
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
-                    }))
-                } else {
-                    drop(stdin_handle);
-                    None
-                };
+                // Commands are always non-interactive: stdin is /dev/null, so
+                // anything that reads it gets EOF immediately.
+                drop(stdin_handle);
 
                 let status = child.wait().await?;
-
-                if let Some(task) = stdin_task {
-                    task.abort();
-                }
 
                 let stdout = stdout_task.await.unwrap_or_default();
                 let stderr = stderr_task.await.unwrap_or_default();
@@ -1257,6 +1108,7 @@ impl BashTool {
 
         let mut cmd = build_detached_shell_wrapper(&params.command);
         cmd.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
+        cmd.envs(crate::session_env::session_env(&ctx.session_id));
         cmd.env("JCODE_SESSION_ID", &ctx.session_id);
         let stdout = OpenOptions::new()
             .create(true)
@@ -1397,7 +1249,10 @@ impl BashTool {
         let working_dir = ctx.working_dir.clone();
         let cloud_environment = cloud_command_environment(working_dir.as_deref())?;
         let session_id_env = ctx.session_id.clone();
-        let timeout_ms = params.timeout.map(|timeout| timeout.min(600000));
+        // Capture before handing work to the manager. Its closure can start
+        // after a caller has already replaced or cleared these overrides.
+        let session_environment = crate::session_env::session_env(&ctx.session_id);
+        let timeout_ms = background_timeout_ms(params.timeout);
         let timeout_duration = timeout_ms.map(Duration::from_millis);
 
         let wake = params.wake;
@@ -1410,18 +1265,14 @@ impl BashTool {
                 notify,
                 wake,
 				move |output_path| async move {
+                    #[cfg(all(test, not(windows)))]
+                    tests::wait_for_session_env_launch_gate(&session_id_env).await;
 					let mut cmd = build_shell_command(&command);
 					cmd.envs(cloud_environment);
+					cmd.envs(session_environment);
 					cmd.env("JCODE_SESSION_ID", &session_id_env);
-					#[cfg(unix)]
-					unsafe {
-						cmd.pre_exec(|| {
-							if libc::setpgid(0, 0) == -1 {
-								return Err(std::io::Error::last_os_error());
-							}
-							Ok(())
-						});
-					}
+					// build_shell_command runs the child in its own session
+					// (setsid), so it is already its own process group leader.
                     cmd.kill_on_drop(true);
                     configure_background_command_stdio(&mut cmd);
                     if let Some(ref dir) = working_dir {

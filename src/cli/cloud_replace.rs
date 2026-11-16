@@ -43,14 +43,18 @@ pub(super) fn run(target: &Target, yes: bool, dry_run: bool, json: bool) -> Resu
     }
     report["host"] = serde_json::Value::String(host.clone());
     if !dry_run {
-        let synced = environment::sync_saved(Path::new(&repo.root), target).is_ok();
+        let synced = match environment::sync_saved(Path::new(&repo.root), target) {
+            Ok(()) => true,
+            Err(_) => {
+                // Do not format private environment failures or retry the replacement.
+                step(
+                    "environment",
+                    "repository replaced, but saved environment requirements need attention; use cloud env push to retry",
+                );
+                false
+            }
+        };
         report["environment_synced"] = serde_json::Value::Bool(synced);
-        if !synced {
-            step(
-                "environment",
-                "repository replaced, but saved environment requirements need attention; use cloud env push to retry",
-            );
-        }
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -71,21 +75,22 @@ pub(super) fn run(target: &Target, yes: bool, dry_run: bool, json: bool) -> Resu
     Ok(())
 }
 
-fn same_repository(path: &Path, root: &Path) -> bool {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    path.starts_with(&root) || root.starts_with(&path)
+fn same_repository(path: &Path, root: &Path) -> Result<bool> {
+    let path = resolved_path(path)?;
+    let root = resolved_path(root)?;
+    Ok(path.starts_with(&root) || root.starts_with(&path))
 }
 
 fn reject_lease(root: &Path, lease: &storage::SessionLease) -> Result<()> {
-    if lease.is_here()
-        && lease
-            .repo_root
-            .as_deref()
-            .is_none_or(|p| same_repository(Path::new(p), root))
+    if (lease.is_here() || lease.away_host.as_deref() == Some("return-pending"))
+        && match lease.repo_root.as_deref() {
+            Some(path) => same_repository(Path::new(path), root)?,
+            None => true,
+        }
     {
         bail!(
-            "repository is owned by cloud session {}; return that session before replacing",
+            "repository is owned by cloud session {}; inactivity does not release its unreturned work. On the source machine run `jcode cloud return --session {} --refs-only`, then retry replacement. This preserves cloud work as Git refs without changing your local checkout and permanently fences the old cloud owner. If return was interrupted, rerun the same command to finish recovery; do not delete the lease",
+            lease.session_id,
             lease.session_id
         );
     }
@@ -93,7 +98,10 @@ fn reject_lease(root: &Path, lease: &storage::SessionLease) -> Result<()> {
 }
 
 fn reject_active_session(root: &Path, id: &str, working_dir: Option<&str>) -> Result<()> {
-    if working_dir.is_none_or(|p| same_repository(Path::new(p), root)) {
+    if match working_dir {
+        Some(path) => same_repository(Path::new(path), root)?,
+        None => true,
+    } {
         bail!("repository may be in use by active cloud session {id}; stop it before replacing");
     }
     Ok(())
@@ -144,6 +152,27 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+#[cfg(test)]
+mod path_error_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn repository_comparison_propagates_symlink_loops() {
+        let temp = tempfile::tempdir().unwrap();
+        let loop_path = temp.path().join("loop");
+        std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+        assert!(same_repository(&loop_path, temp.path()).is_err());
+        assert!(reject_active_session(temp.path(), "active", loop_path.to_str()).is_err());
+    }
+
+    #[test]
+    fn repository_comparison_resolves_expected_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(same_repository(&temp.path().join("absent/child"), temp.path()).unwrap());
+    }
+}
+
 fn validate_destination(root: &Path) -> Result<()> {
     if !root.is_absolute()
         || root.parent().is_none()
@@ -159,17 +188,22 @@ fn validate_destination(root: &Path) -> Result<()> {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 bail!("replacement destination must be a directory, not a symlink or file");
             }
-            if let Ok(metadata) = root.join(".git").symlink_metadata()
-                && (!metadata.is_dir() || metadata.file_type().is_symlink())
-            {
-                bail!("cannot replace a linked worktree or repository with external Git metadata");
+            match root.join(".git").symlink_metadata() {
+                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                    bail!(
+                        "cannot replace a linked worktree or repository with external Git metadata"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("cannot inspect repository metadata"),
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("cannot inspect replacement destination"),
     }
     let resolved = resolved_path(root)?;
-    for protected in [dirs::home_dir(), storage::jcode_dir().ok()]
+    for protected in [dirs::home_dir(), Some(storage::jcode_dir()?)]
         .into_iter()
         .flatten()
     {
@@ -184,7 +218,10 @@ fn install(repo: &RepoManifest, bundle: &Path, id: &str) -> Result<Option<PathBu
     let root = Path::new(&repo.root);
     validate_destination(root)?;
     reject_owners(root)?;
-    let parent = root.parent().unwrap();
+    let parent = root.parent().context("repository path has no parent")?;
+    let filename = root
+        .file_name()
+        .context("repository path has no filename")?;
     std::fs::create_dir_all(parent)?;
     // Keep the lock inode, even after unlocking, so concurrent callers cannot
     // lock different inodes. This lock also survives a receiver crash safely.
@@ -194,7 +231,7 @@ fn install(repo: &RepoManifest, bundle: &Path, id: &str) -> Result<Option<PathBu
         .write(true)
         .open(parent.join(format!(
             ".{}.jcode-replace.lock",
-            root.file_name().unwrap().to_string_lossy()
+            filename.to_string_lossy()
         )))?;
     lock.try_lock()
         .context("another replacement is already running for this checkout")?;
@@ -215,10 +252,15 @@ fn install(repo: &RepoManifest, bundle: &Path, id: &str) -> Result<Option<PathBu
     )?;
     validate_destination(root)?;
     reject_owners(root)?;
-    let backup = if root.symlink_metadata().is_ok() {
+    let exists = match root.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("cannot inspect checkout before backup"),
+    };
+    let backup = if exists {
         let backup = parent.join(format!(
             "{}.jcode-backup-{}",
-            root.file_name().unwrap().to_string_lossy(),
+            filename.to_string_lossy(),
             uuid::Uuid::new_v4()
         ));
         std::fs::rename(root, &backup).context("preserve existing cloud checkout")?;
@@ -353,6 +395,13 @@ mod tests {
                 .contains("another-session")
         );
         lease.away_host = Some("returned".into());
+        // Historical returns have no completion receipt and must remain usable.
+        assert!(reject_lease(root, &lease).is_ok());
+        lease.away_host = Some("return-pending".into());
+        let error = reject_lease(root, &lease).unwrap_err().to_string();
+        assert!(error.contains("jcode cloud return --session another-session --refs-only"));
+        assert!(error.contains("do not delete the lease"));
+        lease.away_host = Some("returned-complete".into());
         assert!(reject_lease(root, &lease).is_ok());
         lease.away_host = None;
         lease.repo_root = Some("/unrelated".into());
@@ -364,6 +413,170 @@ mod tests {
         );
         assert!(reject_active_session(root, "different-session", Some("/unrelated")).is_ok());
         assert!(reject_active_session(root, "unknown-session", None).is_err());
+    }
+
+    #[test]
+    fn durable_return_replays_original_work_after_replacement() {
+        if isolated("durable_return_replays_original_work_after_replacement") {
+            return;
+        }
+        let (cloud, _stage, _) = super::super::repo_tests::repository();
+        std::fs::write(cloud.path().join("cloud-only"), "unreturned work").unwrap();
+        let id = "recover-session";
+        let mut sess = session::Session::create_with_id(id.into(), None, None);
+        sess.working_dir = Some(cloud.path().to_string_lossy().into_owned());
+        sess.migration_epoch = 1;
+        sess.save_prepared().unwrap();
+        storage::write_session_lease(&storage::SessionLease {
+            session_id: id.into(),
+            epoch: 1,
+            away_host: None,
+            repo_root: sess.working_dir.clone(),
+            last_sync_snapshot: None,
+            last_sync_head: None,
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let original = export_return_archive(id, 2, true).unwrap();
+        let lease = storage::read_session_lease(id).unwrap();
+        assert_eq!(lease.away_host.as_deref(), Some("return-pending"));
+        assert!(reject_lease(cloud.path(), &lease).is_err());
+        assert!(complete_return(id, 1).is_err());
+        complete_return(id, 2).unwrap();
+        complete_return(id, 2).unwrap(); // Lost completion response is retryable.
+        let lease = storage::read_session_lease(id).unwrap();
+        assert!(reject_lease(cloud.path(), &lease).is_ok());
+        let (_source, stage, mut repo) = source();
+        repo.root = cloud.path().to_string_lossy().into_owned();
+        let backup = install(&repo, &stage.path().join("repo.bundle"), "replacement")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("cloud-only")).unwrap(),
+            "unreturned work"
+        );
+        assert!(!cloud.path().join("cloud-only").exists());
+        assert_eq!(export_return_archive(id, 2, true).unwrap(), original);
+        let archive = tempfile::tempdir().unwrap();
+        let tar = archive.path().join("return.tar");
+        std::fs::write(&tar, &original).unwrap();
+        untar(&tar, archive.path()).unwrap();
+        let manifest: MoveManifest = read_json(&archive.path().join("manifest.json")).unwrap();
+        let snapshot = manifest.repo.unwrap().snapshot;
+        git(
+            cloud.path(),
+            &[
+                "fetch",
+                archive.path().join("repo.bundle").to_str().unwrap(),
+                &snapshot,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            git(cloud.path(), &["show", &format!("{snapshot}:cloud-only")]).unwrap(),
+            "unreturned work"
+        );
+        assert!(
+            run_cli(super::super::super::args::CloudCommand::CancelReturn {
+                session: id.into(),
+                epoch: 2
+            })
+            .is_err()
+        );
+        // Even a leftover staged activation cannot revive the old owner.
+        let staged = inbox_dir().unwrap().join(format!("{id}.1"));
+        std::fs::create_dir_all(staged).unwrap();
+        assert!(
+            run_activate(id, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("stale activation")
+        );
+        std::fs::remove_file(return_state_path(id, 2, "export.tar").unwrap()).unwrap();
+        assert!(
+            export_return_archive(id, 2, true)
+                .unwrap_err()
+                .to_string()
+                .contains("possibly replaced checkout")
+        );
+    }
+
+    #[test]
+    fn legacy_export_does_not_require_completion_and_pending_export_can_cancel() {
+        if isolated("legacy_export_does_not_require_completion_and_pending_export_can_cancel") {
+            return;
+        }
+        for (id, require_completion) in [("legacy-client", false), ("new-client", true)] {
+            let mut sess = session::Session::create_with_id(id.into(), None, None);
+            sess.working_dir = None;
+            sess.migration_epoch = 1;
+            sess.save_prepared().unwrap();
+            storage::write_session_lease(&storage::SessionLease {
+                session_id: id.into(),
+                epoch: 1,
+                away_host: None,
+                repo_root: None,
+                last_sync_snapshot: None,
+                last_sync_head: None,
+                updated_at: String::new(),
+            })
+            .unwrap();
+            let bytes = export_return_archive(id, 2, require_completion).unwrap();
+            let lease = storage::read_session_lease(id).unwrap();
+            assert_eq!(
+                lease.away_host.as_deref(),
+                Some(if require_completion {
+                    "return-pending"
+                } else {
+                    "returned"
+                })
+            );
+            let archive = tempfile::tempdir().unwrap();
+            let tar = archive.path().join("return.tar");
+            std::fs::write(&tar, bytes).unwrap();
+            untar(&tar, archive.path()).unwrap();
+            assert_eq!(
+                archive.path().join("return-completion-v1").exists(),
+                require_completion
+            );
+            if require_completion {
+                run_cli(super::super::super::args::CloudCommand::CancelReturn {
+                    session: id.into(),
+                    epoch: 2,
+                })
+                .unwrap();
+                assert!(storage::read_session_lease(id).unwrap().is_here());
+                assert!(!return_state_path(id, 2, "export.tar").unwrap().exists());
+            } else {
+                assert!(reject_lease(Path::new("/repo"), &lease).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn durable_return_state_is_private_and_rejects_path_traversal() {
+        assert!(return_state_path("../escape", 1, "export.tar").is_err());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("return/export.tar");
+        write_return_state(&path, b"first").unwrap();
+        write_return_state(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]
@@ -525,17 +738,8 @@ mod tests {
 
     #[test]
     fn repository_ownership_includes_subdirectories_and_ancestors() {
-        assert!(same_repository(
-            Path::new("/repo/subdir"),
-            Path::new("/repo")
-        ));
-        assert!(same_repository(
-            Path::new("/repo"),
-            Path::new("/repo/subdir")
-        ));
-        assert!(!same_repository(
-            Path::new("/repo-other"),
-            Path::new("/repo")
-        ));
+        assert!(same_repository(Path::new("/repo/subdir"), Path::new("/repo")).unwrap());
+        assert!(same_repository(Path::new("/repo"), Path::new("/repo/subdir")).unwrap());
+        assert!(!same_repository(Path::new("/repo-other"), Path::new("/repo")).unwrap());
     }
 }

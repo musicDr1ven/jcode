@@ -1,87 +1,8 @@
 use super::*;
-
-#[tokio::test]
-async fn catalog_request_headers_follow_provider_auth_rules() {
-    for base in [
-        "https://api.anthropic.com/v1",
-        "https://API.ANTHROPIC.COM/v1",
-    ] {
-        for auth in [
-            ProviderAuth::AuthorizationBearer {
-                token: "test-key".into(),
-                label: "test".into(),
-            },
-            ProviderAuth::HeaderValue {
-                header_name: HeaderName::from_static("x-api-key"),
-                value: "test-key".into(),
-                label: "test".into(),
-            },
-        ] {
-            let request = auth
-                .apply_catalog(Client::new().get(format!("{base}/models")), base)
-                .await
-                .unwrap()
-                .build()
-                .unwrap();
-            assert_eq!(request.method(), reqwest::Method::GET);
-            assert_eq!(request.url().path(), "/v1/models");
-            assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
-            assert_eq!(request.headers()["x-api-key"], "test-key");
-            assert!(request.headers().get("authorization").is_none());
-            assert_eq!(request.headers().get_all("x-api-key").iter().count(), 1);
-        }
-    }
-
-    for base in [
-        "https://openrouter.ai/api/v1",
-        "https://api.openai.com/v1",
-        "http://localhost:11434/v1",
-    ] {
-        for (auth, expected_header, expected_value) in [
-            (
-                ProviderAuth::AuthorizationBearer {
-                    token: "test-key".into(),
-                    label: "test".into(),
-                },
-                Some("authorization"),
-                "Bearer test-key",
-            ),
-            (
-                ProviderAuth::HeaderValue {
-                    header_name: HeaderName::from_static("api-key"),
-                    value: "test-key".into(),
-                    label: "test".into(),
-                },
-                Some("api-key"),
-                "test-key",
-            ),
-            (
-                ProviderAuth::None {
-                    label: "test".into(),
-                },
-                None,
-                "",
-            ),
-        ] {
-            let request = auth
-                .apply_catalog(Client::new().get(format!("{base}/models")), base)
-                .await
-                .unwrap()
-                .build()
-                .unwrap();
-            assert!(request.headers().get("anthropic-version").is_none());
-            assert!(request.headers().get("x-api-key").is_none());
-            if let Some(header) = expected_header {
-                assert_eq!(request.headers()[header], expected_value);
-            } else {
-                assert!(request.headers().is_empty());
-            }
-        }
-    }
-}
 use bytes::Bytes;
 use futures::StreamExt;
 use jcode_provider_openrouter::stream::OpenRouterStream;
+
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -89,6 +10,63 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 use tempfile::TempDir;
+
+#[test]
+fn cache_breakpoint_preserves_shared_payload_when_already_marked() {
+    let original = Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "large-output".into(),
+                content: "x".repeat(1024 * 1024),
+                is_error: None,
+            },
+            ContentBlock::Text {
+                text: "continue".into(),
+                cache_control: Some(CacheControl::ephemeral(Some("1h".into()))),
+            },
+        ]
+        .into(),
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+    let mut request = vec![original.clone()];
+    let before = serde_json::to_vec(&request).unwrap();
+    assert!(add_cache_breakpoint(&mut request));
+    assert!(request[0].content.shares_storage_with(&original.content));
+    assert_eq!(serde_json::to_vec(&request).unwrap(), before);
+}
+
+#[test]
+fn cache_breakpoint_detaches_only_when_a_marker_is_missing() {
+    let original = Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "continue".into(),
+            cache_control: None,
+        }]
+        .into(),
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+    let mut request = vec![original.clone()];
+    assert!(add_cache_breakpoint(&mut request));
+    assert!(!request[0].content.shares_storage_with(&original.content));
+    assert!(matches!(
+        &original.content[0],
+        ContentBlock::Text {
+            cache_control: None,
+            ..
+        }
+    ));
+    let marked = request[0].clone();
+    assert!(add_cache_breakpoint(&mut request));
+    assert!(request[0].content.shares_storage_with(&marked.content));
+    assert!(!add_cache_breakpoint(&mut [Message {
+        role: Role::Assistant,
+        ..original
+    }]));
+}
 
 pub(crate) struct SharedEnvLock;
 
@@ -454,7 +432,8 @@ fn deepseek_image_input_captured_requests_preserve_only_allowed_pixels() {
                 media_type: "image/png".to_string(),
                 data: pixels.to_string(),
             },
-        ],
+        ]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -552,7 +531,8 @@ fn direct_deepseek_profile_omits_image_url_parts() {
                 media_type: "image/png".to_string(),
                 data: "aW1hZ2U=".to_string(),
             },
-        ],
+        ]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -621,7 +601,8 @@ fn interrupted_reasoning_only_assistant_message_is_not_sent_empty() {
             content: vec![ContentBlock::Text {
                 text: "do a thing".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -631,7 +612,8 @@ fn interrupted_reasoning_only_assistant_message_is_not_sent_empty() {
             role: Role::Assistant,
             content: vec![ContentBlock::Reasoning {
                 text: "thinking about the request".to_string(),
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -640,7 +622,8 @@ fn interrupted_reasoning_only_assistant_message_is_not_sent_empty() {
             content: vec![ContentBlock::Text {
                 text: "actually do this instead".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -714,7 +697,8 @@ fn interrupted_reasoning_only_assistant_message_keeps_reasoning_with_content() {
             content: vec![ContentBlock::Text {
                 text: "do a thing".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -722,7 +706,8 @@ fn interrupted_reasoning_only_assistant_message_keeps_reasoning_with_content() {
             role: Role::Assistant,
             content: vec![ContentBlock::Reasoning {
                 text: "thinking about the request".to_string(),
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -731,7 +716,8 @@ fn interrupted_reasoning_only_assistant_message_keeps_reasoning_with_content() {
             content: vec![ContentBlock::Text {
                 text: "actually do this instead".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -808,7 +794,8 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
             content: vec![ContentBlock::Text {
                 text: "list the files".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -821,7 +808,8 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -831,7 +819,8 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
                 tool_use_id: "call_1".to_string(),
                 content: "a.txt\nb.txt".to_string(),
                 is_error: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -902,7 +891,8 @@ fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
             content: vec![ContentBlock::Text {
                 text: "list the files".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -918,7 +908,8 @@ fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
                     input: serde_json::json!({"command": "ls"}),
                     thought_signature: None,
                 },
-            ],
+            ]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -928,7 +919,8 @@ fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
                 tool_use_id: "call_1".to_string(),
                 content: "a.txt\nb.txt".to_string(),
                 is_error: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1629,7 +1621,8 @@ fn openrouter_chat_request_sends_unified_reasoning_effort() {
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1741,7 +1734,8 @@ async fn live_openrouter_unified_reasoning_smoke() -> Result<()> {
             content: vec![ContentBlock::Text {
                 text: "Live smoke test: answer exactly OK.".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         }];
@@ -1794,7 +1788,8 @@ fn direct_deepseek_chat_request_sends_reasoning_effort() {
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1850,7 +1845,8 @@ fn sol_compatible_request_sends_low_reasoning_effort() {
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1902,7 +1898,8 @@ fn direct_openai_compatible_chat_request_preserves_max_reasoning_effort() {
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -3529,7 +3526,8 @@ model_catalog = false
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -3618,3 +3616,6 @@ fn venice_disables_venice_system_prompt_by_default_but_user_can_override() {
     );
     assert!(OpenRouterProvider::with_profile_default_extra_body(Some("cerebras"), None).is_none());
 }
+
+#[path = "catalog_auth_tests.rs"]
+mod catalog_auth;

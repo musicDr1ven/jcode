@@ -898,7 +898,7 @@ fn neuralwatt_models_are_listed_and_a_request_round_trips_a_tool_result() -> Res
         content: vec![ContentBlock::Text {
             text: "list the directory".to_string(),
             cache_control: None,
-        }],
+        }].into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -943,7 +943,7 @@ fn neuralwatt_models_are_listed_and_a_request_round_trips_a_tool_result() -> Res
                 name: "bash".to_string(),
                 input: serde_json::json!({ "command": "echo hi" }),
                 thought_signature: None,
-            }],
+            }].into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -953,7 +953,7 @@ fn neuralwatt_models_are_listed_and_a_request_round_trips_a_tool_result() -> Res
                 tool_use_id: "call_1".to_string(),
                 content: "hi".to_string(),
                 is_error: None,
-            }],
+            }].into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1027,7 +1027,7 @@ default_model = "glm-5.3"
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }].into(),
         timestamp: None,
         tool_duration_ms: None,
     }];

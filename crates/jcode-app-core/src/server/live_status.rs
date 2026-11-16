@@ -55,6 +55,10 @@ impl Projection {
     }
 
     fn observe(&mut self, event: &ServerEvent, now: Instant) {
+        let event = match event {
+            ServerEvent::TurnEvent { event, .. } => event.as_ref(),
+            event => event,
+        };
         match event {
             ServerEvent::ConnectionType { connection } => {
                 self.value.connection_type = Some(connection.clone())
@@ -111,7 +115,7 @@ impl Projection {
                     + self
                         .streaming_started
                         .map(|s| now.saturating_duration_since(s))
-                        .unwrap_or_default();
+                        .unwrap_or(Duration::ZERO);
                 self.value.output_tps_milli = (elapsed.as_secs_f64() > 0.1
                     && self.total_output > 0)
                     .then(|| (self.total_output as f64 * 1000.0 / elapsed.as_secs_f64()) as u64);
@@ -130,7 +134,15 @@ impl Projection {
                 self.value.tool_intent = self
                     .tool_inputs
                     .remove(id)
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|s| match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            crate::logging::debug(&format!(
+                                "Live tool intent unavailable for {id}: {error}"
+                            ));
+                            None
+                        }
+                    })
                     .and_then(|v| v.get("intent").and_then(|s| s.as_str()).map(str::to_owned));
             }
             ServerEvent::ToolDone { .. } => {
@@ -190,12 +202,12 @@ pub(super) fn observe(session_id: &str, event: &ServerEvent) {
         .get_mut(session_id)
     {
         let previous = p.value.clone();
-        let final_phase = p.ended.map(|_| p.value.phase.clone());
+        let final_phase = p.ended.map(|ended| (ended, p.value.phase.clone()));
         p.observe(event, Instant::now());
         // The forwarding task can drain trailing usage after the lifecycle
         // completed. Keep those counts without reviving a stopped spinner.
-        if let Some(phase) = final_phase {
-            p.pause(p.ended.unwrap());
+        if let Some((ended, phase)) = final_phase {
+            p.pause(ended);
             p.value.phase = phase;
         }
         if previous != p.value {
@@ -306,6 +318,7 @@ mod tests {
             output,
             cache_read_input: None,
             cache_creation_input: None,
+            effective_budget: None,
         };
         p.observe(&request(), now);
         p.observe(&usage(20), now);
@@ -357,6 +370,7 @@ mod tests {
                 output: 20,
                 cache_read_input: Some(900),
                 cache_creation_input: None,
+                effective_budget: None,
             },
             start + Duration::from_secs(2),
         );
@@ -368,6 +382,7 @@ mod tests {
                 output: 20,
                 cache_read_input: None,
                 cache_creation_input: None,
+                effective_budget: None,
             },
             start + Duration::from_secs(2),
         );
@@ -384,6 +399,7 @@ mod tests {
                 output: 20,
                 cache_read_input: None,
                 cache_creation_input: None,
+                effective_budget: None,
             },
             start + Duration::from_secs(2),
         );
@@ -432,6 +448,7 @@ mod tests {
                 output: 10,
                 cache_read_input: None,
                 cache_creation_input: None,
+                effective_budget: None,
             },
             start + Duration::from_secs(103),
         );

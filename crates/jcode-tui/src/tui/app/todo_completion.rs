@@ -14,6 +14,9 @@ pub(super) struct TodoCompletionReportState {
     fingerprint: Option<u64>,
     checked_at: Option<Instant>,
     observations: Vec<crate::todo::GateObservation>,
+    /// When this completion cycle first finished. Late assessment writes
+    /// update the report but keep this original time.
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl App {
@@ -42,7 +45,16 @@ impl App {
         }
         self.todo_completion_report.checked_at = Some(Instant::now());
 
-        let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
+        let todos = match crate::todo::load_todos(&session_id) {
+            Ok(value) => value,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot refresh todo completion report (todos): {error}"
+                ));
+                // Keep the last valid report instead of declaring unreadable work complete.
+                return false;
+            }
+        };
         if todos.is_empty()
             || todos.iter().any(|todo| {
                 !crate::todo::todo_status_is_completed(&todo.status)
@@ -52,11 +64,39 @@ impl App {
             // Reopening work starts a new cycle; preserve its earlier report.
             self.todo_completion_report.fingerprint = None;
             self.todo_completion_report.observations.clear();
+            self.todo_completion_report.completed_at = None;
             return false;
         }
-        let plan = crate::todo::load_plan(&session_id).unwrap_or_default();
-        let goals = crate::todo::load_goals(&session_id).unwrap_or_default();
-        let recorded = crate::todo::load_gate_observations(&session_id).unwrap_or_default();
+        let plan = match crate::todo::load_plan(&session_id) {
+            Ok(value) => value,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot refresh todo completion report (plan): {error}"
+                ));
+                // Keep the last valid report instead of declaring unreadable work complete.
+                return false;
+            }
+        };
+        let goals = match crate::todo::load_goals(&session_id) {
+            Ok(value) => value,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot refresh todo completion report (goals): {error}"
+                ));
+                // Keep the last valid report instead of declaring unreadable work complete.
+                return false;
+            }
+        };
+        let recorded = match crate::todo::load_gate_observations(&session_id) {
+            Ok(value) => value,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot refresh todo completion report (recorded): {error}"
+                ));
+                // Keep the last valid report instead of declaring unreadable work complete.
+                return false;
+            }
+        };
         // Turn-end processing clears the live log. Retain this completion
         // cycle's findings, including repeat counts, across that clearing and
         // late assessment writes. A reopened cycle starts a fresh collection.
@@ -90,8 +130,13 @@ impl App {
 
         // Persist data rather than a reference to the live todo file so earlier
         // completion cycles remain unchanged when work resumes.
+        let completed_at = *self
+            .todo_completion_report
+            .completed_at
+            .get_or_insert_with(chrono::Utc::now);
         let content = serde_json::json!({
             "todo_completion_version": 1,
+            "completed_at": completed_at,
             "todos": todos,
             "plan": plan,
             "goals": goals,

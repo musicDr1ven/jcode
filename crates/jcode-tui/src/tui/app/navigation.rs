@@ -1,3 +1,5 @@
+#[path = "navigation_diagram_fit.rs"]
+mod diagram_fit;
 use super::*;
 use crate::tui::ui::input_ui;
 use ratatui::layout::Rect;
@@ -132,47 +134,6 @@ impl App {
                 ("after", after.summary()),
             ],
         );
-    }
-
-    fn current_visible_diagram_hash(&self) -> Option<u64> {
-        if self.diagram_mode != crate::config::DiagramDisplayMode::Pinned
-            || !self.diagram_pane_enabled
-        {
-            return None;
-        }
-        if self.side_panel.focused_page().is_some()
-            && self.diagram_pane_position == crate::config::DiagramPanePosition::Side
-        {
-            return None;
-        }
-        let diagrams = crate::tui::mermaid::get_active_diagrams();
-        diagrams
-            .get(self.diagram_index.min(diagrams.len().saturating_sub(1)))
-            .map(|diagram| diagram.hash)
-    }
-
-    pub(super) fn reset_diagram_view_to_fit(&mut self) {
-        self.diagram_scroll_x = 0;
-        self.diagram_scroll_y = 0;
-        self.diagram_zoom = 100;
-    }
-
-    pub(super) fn sync_diagram_fit_context(&mut self) {
-        let current_hash = self.current_visible_diagram_hash();
-        if current_hash != self.last_visible_diagram_hash {
-            self.reset_diagram_view_to_fit();
-            self.last_visible_diagram_hash = current_hash;
-        }
-    }
-
-    pub(super) fn handle_diagram_geometry_change(&mut self) {
-        self.reset_diagram_view_to_fit();
-        if self.side_panel.focused_page().is_some() {
-            self.diff_pane_scroll_x = 0;
-        }
-        crate::tui::mermaid::clear_image_state();
-        crate::tui::clear_side_panel_render_caches();
-        self.last_visible_diagram_hash = self.current_visible_diagram_hash();
     }
 
     /// If a left-click landed on an inline image's `expand` badge or on the
@@ -332,7 +293,8 @@ impl App {
             });
             return true;
         }
-        let Some(target) = super::super::ui::link_target_from_screen(column, row) else {
+        let Some(target) = super::super::ui::link_target_from_screen_with_state(column, row, self)
+        else {
             return false;
         };
 
@@ -429,7 +391,8 @@ impl App {
         F: FnMut(&str) -> Result<(), E>,
         E: std::fmt::Display,
     {
-        let Some(url) = super::super::ui::link_target_from_screen(column, row) else {
+        let Some(url) = super::super::ui::link_target_from_screen_with_state(column, row, self)
+        else {
             return false;
         };
 
@@ -1501,6 +1464,16 @@ impl App {
         let mut terminal_width: u16 = 0;
         let mut terminal_height: u16 = 0;
         if let Some(layout) = layout {
+            if crate::tui::TuiState::status_notice(self).as_deref()
+                == Some(super::super::ui::SIDE_PANEL_DISMISSED_HINT)
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && super::super::ui::side_panel_restore_area().is_some_and(|area| {
+                    super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
+                })
+            {
+                self.toggle_side_panel();
+                finish_mouse_event!(false, "side_panel_restore");
+            }
             if self.side_panel.focused_page().is_some()
                 && !crate::tui::TuiState::swarm_panel_full_page(self)
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1570,7 +1543,26 @@ impl App {
             })
         {
             self.pinned_todos_expanded = !self.pinned_todos_expanded;
+            crate::tui::ui::viewport::reset_pinned_todo_scroll();
             finish_mouse_event!(false, "pinned_todos_toggle");
+        }
+
+        if self.pinned_todos_expanded
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && crate::tui::ui::viewport::pinned_todo_scroll_area().is_some_and(|area| {
+                super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
+            })
+        {
+            let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                -(Self::MOUSE_SCROLL_INTENT_LINES as isize)
+            } else {
+                Self::MOUSE_SCROLL_INTENT_LINES as isize
+            };
+            crate::tui::ui::viewport::scroll_pinned_todos(delta);
+            finish_mouse_event!(false, "pinned_todos_scroll");
         }
 
         // A left press in the composer moves the caret first (native text-field

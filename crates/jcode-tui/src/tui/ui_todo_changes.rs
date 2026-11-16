@@ -37,10 +37,18 @@ pub(super) fn todos_from_tool_input(tc: &ToolCall) -> Option<Vec<TodoItem>> {
         #[derive(serde::Deserialize)]
         struct Lane {
             lane: String,
+            #[serde(default)]
+            after: Option<Vec<String>>,
             items: Vec<TodoItem>,
         }
 
-        let phases = serde_json::from_value::<Vec<Phase>>(phases.clone()).ok()?;
+        let phases = match serde_json::from_value::<Vec<Phase>>(phases.clone()) {
+            Ok(phases) => phases,
+            Err(error) => {
+                crate::logging::debug(&format!("Cannot render todo phase changes: {error}"));
+                return None;
+            }
+        };
         let mut todos = Vec::new();
         for phase in phases {
             if phase.phase == 0 || phase.lanes.is_empty() {
@@ -54,6 +62,9 @@ pub(super) fn todos_from_tool_input(tc: &ToolCall) -> Option<Vec<TodoItem>> {
                 for mut item in lane.items {
                     item.stage = Some(phase.phase);
                     item.group = Some(name.to_string());
+                    if lane.after.is_some() {
+                        item.lane_after = lane.after.clone();
+                    }
                     todos.push(item);
                 }
             }
@@ -124,8 +135,7 @@ impl TodoDiff {
 }
 
 fn blocked_of(todo: &TodoItem) -> bool {
-    crate::todo::is_incomplete_todo(todo)
-        && (!todo.blocked_by.is_empty() || crate::todo::todo_has_external_blocker(todo))
+    crate::todo::is_incomplete_todo(todo) && !todo.blocked_by.is_empty()
 }
 
 fn compute_diff(prev: Option<&[TodoItem]>, next: &[TodoItem]) -> TodoDiff {
@@ -143,16 +153,16 @@ fn compute_diff(prev: Option<&[TodoItem]>, next: &[TodoItem]) -> TodoDiff {
         let previous = find_prev(&item.id);
         let blocker_changed = previous
             .map(|old| {
-                old.completely_blocked
+                old.requires_user_auth
                     .as_ref()
                     .map(|blocker| &blocker.reason)
                     != item
-                        .completely_blocked
+                        .requires_user_auth
                         .as_ref()
                         .map(|blocker| &blocker.reason)
             })
             .unwrap_or(true);
-        if crate::todo::todo_completely_blocked(item)
+        if crate::todo::todo_requires_user_auth(item)
             && (blocker_changed
                 || previous
                     .is_some_and(|old| old.status != item.status || old.content != item.content))
@@ -371,22 +381,27 @@ mod tests {
     fn complete_blocker_changes_are_visible_and_width_safe() {
         let before = todo("1", "Connect", "pending");
         let mut after = before.clone();
-        after.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
+        after.requires_user_auth = Some(crate::todo::TodoUserAuth {
             reason: "Only the owner can approve".into(),
         });
-        let lines = render_todo_change_lines(Some(&[before.clone()]), &[after.clone()], 200);
+        let lines =
+            render_todo_change_lines(Some(std::slice::from_ref(&before)), &[after.clone()], 200);
         let text = lines
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("✋ Completely blocked: Only the owner can approve"));
+        assert!(text.contains("✋ Needs your login: Only the owner can approve"));
         assert!(text.contains("Only the owner can approve"));
         for width in 0..100 {
             assert!(
-                render_todo_change_lines(Some(&[before.clone()]), &[after.clone()], width)
-                    .iter()
-                    .all(|line| line.width() <= usize::from(width))
+                render_todo_change_lines(
+                    Some(std::slice::from_ref(&before)),
+                    &[after.clone()],
+                    width
+                )
+                .iter()
+                .all(|line| line.width() <= usize::from(width))
             );
         }
         assert!(render_todo_change_lines(Some(&[after.clone()]), &[after.clone()], 200).is_empty());
@@ -416,7 +431,7 @@ mod tests {
                 {"lane": "  parser  ", "items": [item("a"), item("b")]},
                 {"lane": "tests", "items": [item("c")]}
             ]},
-            {"phase": 2, "lanes": [{"lane": "ship", "items": [item("d")]}]}
+            {"phase": 2, "lanes": [{"lane": "ship", "after": ["a"], "items": [item("d")]}]}
         ]}))
         .unwrap();
         assert_eq!(
@@ -427,6 +442,8 @@ mod tests {
             parsed.iter().map(|t| t.stage).collect::<Vec<_>>(),
             [Some(1), Some(1), Some(1), Some(2)]
         );
+        assert_eq!(parsed[3].lane_after, Some(vec!["a".to_string()]));
+        assert!(parsed[..3].iter().all(|todo| todo.lane_after.is_none()));
         assert_eq!(
             parsed
                 .iter()
@@ -486,11 +503,13 @@ mod tests {
             status: status.to_string(),
             priority: "medium".to_string(),
             group: None,
+            lane_after: None,
+            lane_owner: None,
             confidence: None,
             completion_confidence: None,
             confidence_history: Vec::new(),
-            external_blocker: None,
-            completely_blocked: None,
+            waiting_reason: None,
+            requires_user_auth: None,
             waiting_on: Vec::new(),
             blocked_by: Vec::new(),
             assigned_to: None,

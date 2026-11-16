@@ -24,6 +24,11 @@ impl Agent {
         }
     }
 
+    /// True when this copy may not run turns on this machine.
+    pub(crate) fn session_lease_blocked(&self) -> bool {
+        self.session.migration_lease_block().is_some()
+    }
+
     /// True when a newer migrated transcript replaced this copy on disk.
     pub(crate) fn session_copy_is_stale(&self) -> bool {
         matches!(
@@ -34,7 +39,9 @@ impl Agent {
 
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        let _turn = self.claim_server_turn()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
         let input_id = self.add_message(
@@ -74,7 +81,9 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        let _turn = self.claim_server_turn()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
         let input_id = self.add_message_with_display_role(
@@ -137,23 +146,48 @@ impl Agent {
         event_tx: mpsc::UnboundedSender<ServerEvent>,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<()> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        let lease = self.claim_server_turn()?;
+        self.run_reserved_streaming_mpsc(
+            &lease,
+            user_message,
+            images,
+            system_reminder,
+            event_tx,
+            display_role,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_reserved_streaming_mpsc(
+        &mut self,
+        lease: &TurnLease,
+        user_message: &str,
+        images: Vec<(String, String)>,
+        system_reminder: Option<String>,
+        event_tx: mpsc::UnboundedSender<ServerEvent>,
+        display_role: Option<crate::session::StoredDisplayRole>,
+    ) -> Result<()> {
+        self.validate_server_turn(lease)?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         // Inject any pending notifications before the user message
+        let alert_start = self.session.messages.len();
         let alerts = self.take_alerts();
-        if !alerts.is_empty() {
+        for alert in alerts {
             let alert_text = format!(
-                "[NOTIFICATION]\nYou received {} notification(s) from other agents working in this codebase:\n\n{}\n\nUse the communicate tool to coordinate with other agents (prefer dm; broadcast reaches only your spawned subtree).",
-                alerts.len(),
-                alerts.join("\n\n---\n\n")
+                "[NOTIFICATION]\nYou received a notification from another agent working in this codebase:\n\n{alert}\n\nUse the communicate tool to coordinate with other agents (prefer dm; broadcast reaches only your spawned subtree)."
             );
-            self.add_message(
+            self.add_message_with_display_role(
                 Role::User,
                 vec![ContentBlock::Text {
                     text: alert_text,
                     cache_control: None,
                 }],
+                Some(crate::session::StoredDisplayRole::System),
             );
         }
+        self.emit_context_messages_since(alert_start, &event_tx);
 
         let system_reminder = system_reminder.filter(|value| !value.trim().is_empty());
         // A reminder-only turn (e.g. reload recovery) used to persist an empty
@@ -173,21 +207,29 @@ impl Agent {
                 false,
             ),
         };
+        let announcement_start = self.session.messages.len();
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
+        self.emit_context_messages_since(announcement_start, &event_tx);
+        let input_start = self.session.messages.len();
         self.append_user_context_message_with_display_role(
             &user_message,
             images,
             display_role,
             continues_turn,
         )?;
+        if continues_turn || display_role.is_some() {
+            self.emit_context_messages_since(input_start, &event_tx);
+        }
         // The per-turn reminder (swarm DM wake, mission continuation, ...) goes
         // into the transcript after the prompt, never into the system prompt.
         // The system prompt precedes every message, so changing it for one turn
         // invalidated the whole cached conversation on that turn and again on
         // the next turn when it disappeared.
         if let Some(reminder) = system_reminder {
+            let reminder_start = self.session.messages.len();
             self.append_turn_system_reminder(&reminder)?;
+            self.emit_context_messages_since(reminder_start, &event_tx);
         }
         crate::telemetry::record_turn();
         let turn_started_at = Instant::now();
@@ -204,9 +246,11 @@ impl Agent {
     /// retried on the new route exactly as if it had never been sent.
     pub(crate) async fn continue_turn_after_failover(
         &mut self,
+        lease: &TurnLease,
         system_reminder: Option<String>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
+        self.validate_server_turn(lease)?;
         if self.is_graceful_shutdown() {
             return Ok(());
         }
@@ -221,7 +265,55 @@ impl Agent {
         result
     }
 
-    /// Persist a hidden, model-visible `<system-reminder>` message at the tail
+    /// Turn preparation runs before the streaming loop installs its sender.
+    /// Publish each newly appended context message explicitly so clients see a
+    /// new transcript entry, rather than silently changing only model history.
+    fn emit_context_messages_since(
+        &self,
+        start: usize,
+        event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) {
+        for message in &self.session.messages[start..] {
+            let content = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if event_tx
+                .send(ServerEvent::SoftInterruptInjected {
+                    content,
+                    display_role: Some(
+                        match message.display_role {
+                            Some(crate::session::StoredDisplayRole::FileActivity) => {
+                                "file_activity"
+                            }
+                            Some(crate::session::StoredDisplayRole::BackgroundTask) => {
+                                "background_task"
+                            }
+                            _ => "system",
+                        }
+                        .to_string(),
+                    ),
+                    point: "context".to_string(),
+                    tools_skipped: None,
+                    client_ids: Vec::new(),
+                })
+                .is_err()
+            {
+                logging::debug(&format!(
+                    "Context message receiver disconnected for session {}",
+                    self.session.id
+                ));
+                break;
+            }
+        }
+    }
+
+    /// Persist a model-visible `<system-reminder>` message at the tail
     /// of the transcript so it does not disturb the cached prompt prefix.
     fn append_turn_system_reminder(&mut self, reminder: &str) -> Result<()> {
         let reminder = reminder.trim();
@@ -737,6 +829,23 @@ impl Agent {
             let disabled = config.disabled.iter().cloned().collect();
             tools.retain(|tool| !self.registry.tool_is_disabled(&disabled, &tool.name));
         }
+        // Rarely used built-ins ride the same native deferred path as MCP
+        // tools, so the snapshot rebuild on a provider change covers them too.
+        // An SDK tool that reuses a built-in name is the caller's own and stays.
+        let loader = crate::tool::load_tools::LOAD_TOOLS_NAME;
+        let sdk_disabled: HashSet<String> = sdk
+            .iter()
+            .flat_map(|config| config.disabled.iter().cloned())
+            .collect();
+        let loader_allowed = allowed.is_none_or(|set| self.registry.tool_is_allowed(set, loader))
+            && !self.registry.tool_is_disabled(&self.disabled_tools, loader)
+            && !self.registry.tool_is_disabled(&sdk_disabled, loader);
+        crate::tool::load_tools::apply_deferral(
+            &mut tools,
+            self.native_deferred_mcp(),
+            loader_allowed,
+            |name| crate::tool::sdk::custom(&self.session.id, name),
+        );
         tools
     }
 
@@ -862,12 +971,13 @@ impl Agent {
             "Announcing {} late MCP tool(s) in the transcript (tool list stays cache-stable)",
             fresh.len()
         ));
-        self.add_message(
+        self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
                 text,
                 cache_control: None,
             }],
+            Some(crate::session::StoredDisplayRole::System),
         );
     }
 
@@ -911,12 +1021,13 @@ impl Agent {
             "Announcing {} late skill(s) in the transcript (system prompt stays cache-stable)",
             fresh.len()
         ));
-        self.add_message(
+        self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
                 text,
                 cache_control: None,
             }],
+            Some(crate::session::StoredDisplayRole::System),
         );
         self.announced_skills_scan_index = self.session.messages.len();
     }
@@ -1652,60 +1763,9 @@ impl Agent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TurnTokenUsage {
-    prompt_tokens: Option<u64>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-}
-
-fn turn_token_usage_after(
-    messages: &[crate::session::StoredMessage],
-    start_message_index: usize,
-) -> Option<TurnTokenUsage> {
-    let mut usage = TurnTokenUsage {
-        prompt_tokens: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_input_tokens: None,
-        cache_creation_input_tokens: None,
-    };
-    let mut saw_usage = false;
-
-    for message in messages.iter().skip(start_message_index) {
-        if !matches!(&message.role, Role::Assistant) {
-            continue;
-        }
-        let Some(message_usage) = message.token_usage.as_ref() else {
-            continue;
-        };
-
-        saw_usage = true;
-        let add = |acc: Option<u64>, v: Option<u64>| {
-            v.map(|v| acc.unwrap_or(0).saturating_add(v)).or(acc)
-        };
-        usage.prompt_tokens = add(usage.prompt_tokens, message_usage.prompt_tokens);
-        usage.input_tokens = usage
-            .input_tokens
-            .saturating_add(message_usage.input_tokens);
-        usage.output_tokens = usage
-            .output_tokens
-            .saturating_add(message_usage.output_tokens);
-        usage.cache_read_input_tokens = add(
-            usage.cache_read_input_tokens,
-            message_usage.cache_read_input_tokens,
-        );
-        usage.cache_creation_input_tokens = add(
-            usage.cache_creation_input_tokens,
-            message_usage.cache_creation_input_tokens,
-        );
-    }
-
-    saw_usage.then_some(usage)
-}
-
+#[path = "turn_usage.rs"]
+mod turn_usage;
+use turn_usage::turn_token_usage_after;
 /// Cap on tools listed in one late-MCP transcript announcement.
 const MAX_ANNOUNCED_MCP_TOOLS: usize = 32;
 

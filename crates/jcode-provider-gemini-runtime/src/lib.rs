@@ -4,6 +4,8 @@
 //! spine. The binary's composition root registers [`GeminiProvider`] with
 //! `jcode_base::provider::external` at startup.
 
+mod catalog;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -70,45 +72,6 @@ struct CachedGeminiState {
 }
 
 impl GeminiProvider {
-    fn persisted_catalog_path() -> Result<std::path::PathBuf> {
-        Ok(jcode_base::storage::app_config_dir()?.join("gemini_models_cache.json"))
-    }
-
-    fn load_persisted_catalog() -> Option<PersistedCatalog> {
-        let path = Self::persisted_catalog_path().ok()?;
-        jcode_base::storage::read_json(&path)
-            .ok()
-            .filter(|catalog: &PersistedCatalog| !catalog.models.is_empty())
-    }
-
-    fn persist_catalog(models: &[String]) {
-        if models.is_empty() {
-            return;
-        }
-        let Ok(path) = Self::persisted_catalog_path() else {
-            return;
-        };
-        let payload = PersistedCatalog {
-            models: models.to_vec(),
-            fetched_at_rfc3339: Utc::now().to_rfc3339(),
-        };
-        if let Err(error) = jcode_base::storage::write_json(&path, &payload) {
-            jcode_base::logging::warn(&format!(
-                "Failed to persist Gemini model catalog {}: {}",
-                path.display(),
-                error
-            ));
-        }
-    }
-
-    fn seed_cached_catalog(&self) {
-        if let Some(catalog) = Self::load_persisted_catalog()
-            && let Ok(mut models) = self.fetched_models.write()
-        {
-            *models = catalog.models;
-        }
-    }
-
     pub fn new() -> Self {
         let model = std::env::var("JCODE_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         let provider = Self {
@@ -281,78 +244,6 @@ impl GeminiProvider {
             project_id,
             session_id: Uuid::new_v4().to_string(),
         })
-    }
-
-    async fn refresh_available_models(&self) -> Result<Vec<String>> {
-        if let GeminiAuthMode::ApiKey(api_key) = Self::auth_mode() {
-            return self.refresh_available_models_api_key(&api_key).await;
-        }
-        let project_id_env = gemini_auth::cloud_project();
-        let load_req = load_code_assist_request(
-            project_id_env.clone(),
-            client_metadata(project_id_env.clone()),
-        );
-        let response: Value = match self.post_json("loadCodeAssist", &load_req).await {
-            Ok(response) => response,
-            Err(err) if is_vpc_sc_error(&err) => Value::Null,
-            Err(err) => {
-                return Err(err).context("Gemini model discovery failed during loadCodeAssist");
-            }
-        };
-
-        let models = extract_gemini_model_ids(&response);
-        if !models.is_empty() {
-            jcode_base::logging::info(&format!(
-                "Discovered Gemini Code Assist models: {}",
-                models.join(", ")
-            ));
-            if let Ok(mut guard) = self.fetched_models.write() {
-                *guard = models.clone();
-            }
-            Self::persist_catalog(&models);
-        }
-        Ok(models)
-    }
-
-    /// Discover models via the official Developer API `ListModels` endpoint.
-    /// Returned names look like `models/gemini-2.5-pro`, so strip the prefix
-    /// before normalizing through the shared catalog merge.
-    async fn refresh_available_models_api_key(&self, api_key: &str) -> Result<Vec<String>> {
-        let url = format!("{}/models", Self::developer_api_base_url());
-        let response: Value = match self.get_json_api_key(&url, api_key, "ListModels").await {
-            Ok(response) => response,
-            Err(err) => {
-                jcode_base::logging::info(&format!(
-                    "Gemini Developer API model discovery failed: {err:#}"
-                ));
-                return Ok(Vec::new());
-            }
-        };
-
-        let raw: Vec<String> = response
-            .get("models")
-            .and_then(|models| models.as_array())
-            .map(|models| {
-                models
-                    .iter()
-                    .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
-                    .map(|name| name.trim_start_matches("models/").to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let models = merge_gemini_model_lists(raw);
-        if !models.is_empty() {
-            jcode_base::logging::info(&format!(
-                "Discovered Gemini Developer API models: {}",
-                models.join(", ")
-            ));
-            if let Ok(mut guard) = self.fetched_models.write() {
-                *guard = models.clone();
-            }
-            Self::persist_catalog(&models);
-        }
-        Ok(models)
     }
 
     /// Send a request with a single transient-error retry, transparently
@@ -637,42 +528,7 @@ impl GeminiProvider {
             },
         };
 
-        let contents_value = serde_json::to_value(&request.request.contents).unwrap_or(Value::Null);
-        let content_items = contents_value.as_array().cloned().unwrap_or_default();
-        let system_value = request
-            .request
-            .system_instruction
-            .as_ref()
-            .and_then(|system| serde_json::to_value(system).ok());
-        let tools_value = request
-            .request
-            .tools
-            .as_ref()
-            .and_then(|tools| serde_json::to_value(tools).ok());
-        let payload = json!({
-            "model": &request.model,
-            "contents": contents_value,
-            "system_instruction": system_value.as_ref(),
-            "tools": tools_value.as_ref(),
-            "tool_config": &request.request.tool_config,
-        });
-        jcode_provider_core::fingerprint::log_provider_canonical_input(
-            "gemini",
-            model,
-            "gemini_generate_content",
-            &payload,
-            &content_items,
-            system_value.as_ref(),
-            tools_value.as_ref(),
-            request.request.tools.as_ref().map(|tools| tools.len()),
-            &[
-                (
-                    "session_id_present",
-                    request.request.session_id.is_some().to_string(),
-                ),
-                ("project_present", (!request.project.is_empty()).to_string()),
-            ],
-        );
+        log_canonical_input(model, &request);
 
         match Self::auth_mode() {
             GeminiAuthMode::ApiKey(api_key) => {
@@ -699,6 +555,160 @@ impl GeminiProvider {
                 .post_json("generateContent", &request)
                 .await
                 .context("Gemini generateContent failed"),
+        }
+    }
+}
+
+fn canonical_payload(request: &CodeAssistGenerateRequest) -> Value {
+    let mut payload = json!({
+        "model": &request.model,
+        "tool_config": &request.request.tool_config,
+    });
+    let Value::Object(object) = &mut payload else {
+        return Value::Null;
+    };
+    object.insert(
+        "contents".into(),
+        serde_json::to_value(&request.request.contents).unwrap_or(Value::Null),
+    );
+    object.insert(
+        "system_instruction".into(),
+        request
+            .request
+            .system_instruction
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "tools".into(),
+        request
+            .request
+            .tools
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or(Value::Null),
+    );
+    payload
+}
+
+// Keep diagnostic JSON trees in this synchronous frame, never across HTTP awaits.
+fn log_canonical_input(model: &str, request: &CodeAssistGenerateRequest) {
+    let payload = canonical_payload(request);
+    let items = payload["contents"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    jcode_provider_core::fingerprint::log_provider_canonical_input(
+        "gemini",
+        model,
+        "gemini_generate_content",
+        &payload,
+        items,
+        payload
+            .get("system_instruction")
+            .filter(|value| !value.is_null()),
+        payload.get("tools").filter(|value| !value.is_null()),
+        request.request.tools.as_ref().map(Vec::len),
+        &[
+            (
+                "session_id_present",
+                request.request.session_id.is_some().to_string(),
+            ),
+            ("project_present", (!request.project.is_empty()).to_string()),
+        ],
+    );
+}
+
+#[cfg(test)]
+mod canonical_input_tests {
+    use super::*;
+    use jcode_provider_gemini::{GeminiContent, GeminiFunctionDeclaration, GeminiPart, GeminiTool};
+
+    #[test]
+    fn canonical_payload_preserves_exact_schema_hashes_nulls_and_counts() {
+        for variant in 0..3 {
+            let content = GeminiContent {
+                role: "user".into(),
+                parts: vec![GeminiPart {
+                    text: Some("hello 雪".into()),
+                    ..Default::default()
+                }],
+            };
+            let request = CodeAssistGenerateRequest {
+                model: "fixture-model".into(),
+                project: "project".into(),
+                user_prompt_id: "volatile".into(),
+                request: VertexGenerateContentRequest {
+                    contents: vec![content.clone()],
+                    system_instruction: (variant > 0).then(|| content.clone()),
+                    tools: match variant {
+                        0 => None,
+                        1 => Some(vec![]),
+                        _ => Some(vec![GeminiTool {
+                            function_declarations: vec![GeminiFunctionDeclaration {
+                                name: "lookup".into(),
+                                description: "find".into(),
+                                parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                            }],
+                        }]),
+                    },
+                    tool_config: (variant > 0).then_some(GeminiToolConfig {
+                        function_calling_config: GeminiFunctionCallingConfig { mode: "AUTO" },
+                    }),
+                    session_id: Some("session".into()),
+                },
+            };
+            let original_wire = serde_json::to_vec(&request).unwrap();
+            let contents = serde_json::to_value(&request.request.contents).unwrap();
+            let system = request
+                .request
+                .system_instruction
+                .as_ref()
+                .map(|value| serde_json::to_value(value).unwrap());
+            let tools = request
+                .request
+                .tools
+                .as_ref()
+                .map(|value| serde_json::to_value(value).unwrap());
+            let legacy = json!({"model": request.model, "contents": contents, "system_instruction": system.as_ref(), "tools": tools.as_ref(), "tool_config": request.request.tool_config});
+            let payload = canonical_payload(&request);
+            assert_eq!(
+                serde_json::to_vec(&payload).unwrap(),
+                serde_json::to_vec(&legacy).unwrap()
+            );
+            assert_eq!(payload.as_object().unwrap().len(), 5);
+            assert!(!payload.to_string().contains("volatile"));
+            assert_eq!(payload["contents"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["system_instruction"].is_null(), variant == 0);
+            assert_eq!(payload["tools"].is_null(), variant == 0);
+            assert_eq!(
+                request.request.tools.as_ref().map(Vec::len),
+                match variant {
+                    0 => None,
+                    1 => Some(0),
+                    _ => Some(1),
+                }
+            );
+            let hash = jcode_provider_core::fingerprint::stable_hash_json;
+            assert_eq!(hash(&payload), hash(&legacy));
+            assert_eq!(hash(&payload["contents"]), hash(&contents));
+            assert_eq!(
+                payload
+                    .get("system_instruction")
+                    .filter(|value| !value.is_null())
+                    .map(hash),
+                system.as_ref().map(hash)
+            );
+            assert_eq!(
+                payload
+                    .get("tools")
+                    .filter(|value| !value.is_null())
+                    .map(hash),
+                tools.as_ref().map(hash)
+            );
+            log_canonical_input("fixture-model", &request);
+            assert_eq!(serde_json::to_vec(&request).unwrap(), original_wire);
         }
     }
 }
@@ -859,6 +869,10 @@ impl Provider for GeminiProvider {
                     phase: ConnectionPhase::Streaming,
                 }))
                 .await;
+
+            if let Some(event) = response.resolved_model_event() {
+                let _ = tx.send(Ok(event)).await;
+            }
 
             if let Some(usage) = response
                 .response
@@ -1264,3 +1278,6 @@ fn is_gemini_model_not_found_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 #[path = "gemini_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod catalog_tests;

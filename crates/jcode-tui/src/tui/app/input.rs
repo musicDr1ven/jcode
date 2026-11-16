@@ -1,5 +1,8 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+mod terminal_reports;
+mod word_boundaries;
+
 #[path = "input/shell_commands.rs"]
 mod shell_commands;
 use shell_commands::*;
@@ -13,10 +16,11 @@ use crate::bus::{
     Bus, BusEvent, ClipboardPasteCompleted, ClipboardPasteContent, ClipboardPasteKind,
     InputShellCompleted,
 };
+use crate::tui::terminal_events::EventStream;
 use crate::util::truncate_str;
 use anyhow::Result;
 use base64::Engine;
-use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -647,145 +651,7 @@ impl App {
     }
 }
 
-/// Strip terminal escape-sequence remnants from text headed for the composer.
-///
-/// Mouse reporting, bracketed paste, and focus events all arrive as CSI
-/// sequences. When a read is torn mid-sequence (a fast wheel flick split across
-/// two reads, a loaded machine, a slow SSH link), the terminal-event parser can
-/// resynchronize partway through and hand the tail of the sequence back as
-/// ordinary text, which then lands in the draft as noise like `[<65;50;24M`
-/// (issue #540). Whether that happens depends on the terminal and on timing, so
-/// rather than rely on the parser never mis-syncing, drop the remnants at the
-/// single insertion boundary every input path shares.
-///
-/// Deliberately conservative: only ESC-introduced sequences and bare CSI-shaped
-/// runs are removed, plus C0 control characters other than tab and newline.
-///
-/// A *bare* run (one whose ESC introducer was consumed by the torn read) is only
-/// stripped when it looks unmistakably like a terminal report: `[`, at least one
-/// parameter byte, and a final byte that terminals actually emit for the
-/// sequences we enable (`M`/`m` mouse, `~` bracketed paste and special keys,
-/// `R` cursor position, `I`/`O` focus). This is what keeps ordinary typed text
-/// such as `array[0]`, `list[1]`, or `[TODO]` intact, since `]` and letters like
-/// `O` only qualify with a preceding numeric parameter for the specific finals
-/// listed. Anything else is left alone: a missed remnant is cosmetic, whereas
-/// eating a user's real characters is not.
-pub(super) fn strip_terminal_control_sequences(text: &str) -> std::borrow::Cow<'_, str> {
-    let looks_suspicious = text
-        .chars()
-        .any(|ch| ch == '\x1b' || ch == '\u{9b}' || (ch.is_control() && ch != '\t' && ch != '\n'));
-    let has_csi_run = text.contains("\x1b[") || text.contains('\u{9b}') || {
-        let bytes = text.as_bytes();
-        bytes.iter().enumerate().any(|(index, byte)| {
-            *byte == b'[' && bare_terminal_report_length(&bytes[index..]).is_some()
-        })
-    };
-    if !looks_suspicious && !has_csi_run {
-        return std::borrow::Cow::Borrowed(text);
-    }
-
-    let bytes = text.as_bytes();
-    let mut cleaned = String::with_capacity(text.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        // ESC-introduced sequence: skip the introducer, then the body.
-        if byte == 0x1b {
-            index += 1;
-            if index < bytes.len() && bytes[index] == b'[' {
-                match csi_run_length(&bytes[index..]) {
-                    Some(len) => index += len,
-                    // Unterminated: the rest is a truncated sequence, drop it.
-                    None => index = bytes.len(),
-                }
-            } else if index < bytes.len() {
-                // Two-character escape such as ESC O or ESC ].
-                index += 1;
-            }
-            continue;
-        }
-        // 8-bit CSI introducer (UTF-8 encoded U+009B).
-        if byte == 0xc2 && bytes.get(index + 1) == Some(&0x9b) {
-            index += 2;
-            if bytes.get(index) == Some(&b'[') {
-                match csi_run_length(&bytes[index..]) {
-                    Some(len) => index += len,
-                    None => index = bytes.len(),
-                }
-            }
-            continue;
-        }
-        // A bare report-shaped run left behind by a torn read.
-        if byte == b'['
-            && let Some(len) = bare_terminal_report_length(&bytes[index..])
-        {
-            index += len;
-            continue;
-        }
-        // Drop stray C0 controls; keep tab and newline, which are meaningful.
-        if byte < 0x20 && byte != b'\t' && byte != b'\n' {
-            index += 1;
-            continue;
-        }
-        // Copy one whole UTF-8 character.
-        let char_len = text[index..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-        cleaned.push_str(&text[index..index + char_len]);
-        index += char_len;
-    }
-
-    std::borrow::Cow::Owned(cleaned)
-}
-
-/// Length of a CSI run starting at `bytes[0]` (the `[`), including its final
-/// byte, or `None` when the run is unterminated.
-///
-/// A CSI body is parameter bytes `0x30..=0x3f`, then intermediate bytes
-/// `0x20..=0x2f`, then one final byte `0x40..=0x7e`.
-fn csi_run_length(bytes: &[u8]) -> Option<usize> {
-    debug_assert_eq!(bytes.first(), Some(&b'['));
-    let mut index = 1usize;
-    while index < bytes.len() && (0x30..=0x3f).contains(&bytes[index]) {
-        index += 1;
-    }
-    while index < bytes.len() && (0x20..=0x2f).contains(&bytes[index]) {
-        index += 1;
-    }
-    let final_byte = *bytes.get(index)?;
-    if (0x40..=0x7e).contains(&final_byte) {
-        Some(index + 1)
-    } else {
-        None
-    }
-}
-
-/// Length of a bare (ESC-less) run that is unmistakably a terminal report, or
-/// `None` when the run could plausibly be text the user typed.
-///
-/// Requires at least one parameter byte and one of the final bytes emitted by
-/// the reporting modes jcode enables, so `array[0]` and `[TODO]` are left alone
-/// while `[<65;50;24M` and `[200~` are recognized.
-fn bare_terminal_report_length(bytes: &[u8]) -> Option<usize> {
-    debug_assert_eq!(bytes.first(), Some(&b'['));
-    let len = csi_run_length(bytes)?;
-    let params = &bytes[1..len - 1];
-    if params.is_empty() {
-        return None;
-    }
-    // Mouse/paste/cursor/focus reports carry digits, `;`, and an optional
-    // leading `<`. Reject anything with other parameter bytes.
-    if !params
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || *byte == b';' || *byte == b'<')
-    {
-        return None;
-    }
-    const REPORT_FINALS: [u8; 6] = *b"Mm~RIO";
-    REPORT_FINALS.contains(&bytes[len - 1]).then_some(len)
-}
+pub(super) use terminal_reports::strip_terminal_control_sequences;
 
 /// Remove late OSC 10/11 color replies that the terminal delivered as keys.
 ///
@@ -1468,6 +1334,7 @@ impl App {
         self.interleave_message.is_some()
             || !self.queued_messages.is_empty()
             || !self.hidden_queued_system_messages.is_empty()
+            || self.has_pending_cloud_recovery()
     }
 
     /// True when the user typed a follow-up prompt while this turn ran, and
@@ -1566,6 +1433,16 @@ impl App {
         &mut self,
         final_response_delivered: bool,
     ) -> bool {
+        // Playback observes recorded turns. It must never create new work from
+        // the current machine's todos, guardrails, or overnight configuration.
+        if self.is_replay {
+            return false;
+        }
+        // SSH workflow state and todo reads belong to the remote daemon.
+        // Even the guardrail/report checks below consult laptop session files.
+        if crate::tui::is_ssh_remote() {
+            return false;
+        }
         if self.guardrail_stops_exhausted_at_turn_end() {
             self.stop_auto_continuation_after_guardrail();
             return false;
@@ -1599,6 +1476,12 @@ impl App {
         &mut self,
         final_response_delivered: bool,
     ) -> bool {
+        if self.is_replay {
+            return false;
+        }
+        if crate::tui::is_ssh_remote() {
+            return false;
+        }
         // Completion is visible even with /poke off, and never needs another
         // model turn merely to show the plan's remaining weaknesses.
         self.refresh_completed_todo_report(true);
@@ -1668,7 +1551,9 @@ impl App {
             self.todo_confidence_spike_challenged = false;
             self.last_todo_ownership_fingerprint = None;
         }
-        if !todos.is_empty()
+        let quality_reviews_enabled = crate::config::config().features.todo_gate_digest;
+        if quality_reviews_enabled
+            && !todos.is_empty()
             && crate::todo::take_long_session_review_if_due(&todo_session_id).unwrap_or(false)
         {
             self.push_display_message(DisplayMessage::system(
@@ -1715,8 +1600,8 @@ impl App {
                     return true;
                 }
             }
-            let ownership_needs_followup =
-                !crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
+            let ownership_needs_followup = quality_reviews_enabled
+                && !crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
             let gate_budget_left =
                 self.todo_completion_gate_attempts < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
             let ownership_message =
@@ -1752,14 +1637,19 @@ impl App {
                 return true;
             }
             let confidence_summary = super::commands::todo_confidence_summary(&todos);
-            let needs_spike_challenge = confidence_summary.confidence_spike_detected
+            let needs_spike_challenge = quality_reviews_enabled
+                && confidence_summary.confidence_spike_detected
                 && !self.todo_confidence_spike_challenged;
-            if (confidence_summary.completion_confidence_needs_validation || needs_spike_challenge)
-                && gate_budget_left
-            {
+            // Goals that document why validation stopped exempt their todos:
+            // asking again cannot change an exhausted constraint.
+            let validation_targets = crate::todo::todos_needing_validation(&todos, &goals);
+            let needs_validation = quality_reviews_enabled
+                && confidence_summary.completion_confidence_needs_validation
+                && !validation_targets.is_empty();
+            if (needs_validation || needs_spike_challenge) && gate_budget_left {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
-                let notice = if confidence_summary.completion_confidence_needs_validation {
+                let notice = if needs_validation {
                     crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
                     "🔍 Double-checking confidence for you..."
                 } else {
@@ -1772,14 +1662,16 @@ impl App {
                 self.push_display_message(DisplayMessage::system(notice));
                 // User-role content: reminder-only turns read as empty user
                 // messages and models answer instead of re-validating.
-                let summary = super::commands::build_todo_confidence_summary_message(&todos);
+                let summary = if needs_validation {
+                    crate::todo::build_todo_validation_continuation_message(&validation_targets)
+                } else {
+                    crate::todo::build_todo_confidence_spike_continuation_message(&todos)
+                };
                 self.queued_messages.push(summary);
                 self.pending_queued_dispatch = true;
                 return true;
             }
-            if (ownership_needs_followup
-                || confidence_summary.completion_confidence_needs_validation
-                || needs_spike_challenge)
+            if (ownership_needs_followup || needs_validation || needs_spike_challenge)
                 && !gate_budget_left
             {
                 // The gate keeps failing but the model is no longer making
@@ -1947,10 +1839,9 @@ impl App {
         }
     }
 
+    /// Works over SSH too: the fork is created by the attached daemon and the
+    /// new window is another SSH client, so nothing is read from this machine.
     pub(crate) fn toggle_next_prompt_new_session_routing(&mut self) {
-        if super::commands_dispatch::ssh_local_action_blocked(self, "New-session routing") {
-            return;
-        }
         self.route_next_prompt_to_new_session = !self.route_next_prompt_to_new_session;
         if self.route_next_prompt_to_new_session {
             self.set_status_notice("Next prompt → new session");
@@ -2304,6 +2195,8 @@ pub(super) fn handle_alt_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('e') => {
             let expanded = crate::tui::ui::viewport::toggle_prompt_history_expanded();
+            app.prompt_history_backfill = (None, 0);
+            app.maybe_backfill_expanded_prompt_history();
             app.set_status_notice(if expanded {
                 "Prompt history: showing more previous prompts (Alt+E to collapse)"
             } else {
@@ -2315,11 +2208,28 @@ pub(super) fn handle_alt_key(app: &mut App, code: KeyCode) -> bool {
     }
 }
 
+pub(super) fn handle_account_shortcut(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> bool {
+    if modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(code, KeyCode::Char('j' | 'k'))
+    {
+        app.cycle_account(code == KeyCode::Char('j'));
+        return true;
+    }
+    false
+}
+
 pub(super) fn handle_navigation_shortcuts(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    if handle_account_shortcut(app, code, modifiers) {
+        return true;
+    }
     if let Some(amount) = app.scroll_keys.scroll_amount(code, modifiers) {
         if amount < 0 {
             app.scroll_up((-amount) as usize);
@@ -2461,6 +2371,9 @@ pub(super) fn handle_pre_control_shortcuts(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    if handle_account_shortcut(app, code, modifiers) {
+        return true;
+    }
     // Plain Ctrl+K kills to end of line (emacs habit). Ctrl+Shift+K must fall
     // through to the scroll handler: with the Kitty keyboard protocol enabled,
     // terminals report Ctrl+Shift+K as Char('k') + CONTROL|SHIFT, so without the
@@ -2568,6 +2481,9 @@ pub(super) fn handle_pre_control_shortcuts(
     if app.open_resume_key_matches(code, modifiers) {
         app.record_keybinding_fast(super::shortcut_hints::LearnableAction::Resume);
         app.open_session_picker();
+        if let Some(picker) = app.session_picker_overlay.as_ref() {
+            picker.borrow_mut().activate_search();
+        }
         return true;
     }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
@@ -2868,9 +2784,21 @@ pub(super) fn handle_global_control_shortcuts(
             } else if !app.input.is_empty() {
                 // First Ctrl+C: clear the input box
                 app.input.clear();
+                let detached = app
+                    .pending_images
+                    .iter()
+                    .filter(|(_, data)| !data.is_empty())
+                    .count();
                 app.pending_images.clear();
                 app.cursor_pos = 0;
-                app.set_status_notice("Input cleared. Press Ctrl+C again to quit");
+                if detached > 0 {
+                    app.set_status_notice(format!(
+                        "Input cleared · Detached {detached} image{} · 0 attached. Press Ctrl+C again to quit",
+                        if detached == 1 { "" } else { "s" }
+                    ));
+                } else {
+                    app.set_status_notice("Input cleared. Press Ctrl+C again to quit");
+                }
             } else {
                 // Second Ctrl+C (input already empty): proceed with quit
                 app.handle_quit_request();
@@ -3060,7 +2988,7 @@ pub(super) fn take_prepared_input(app: &mut App) -> PreparedInput {
     app.record_prompt_history(&raw_input);
     let expanded = expand_paste_placeholders(app, &raw_input);
     app.pasted_contents.clear();
-    let images = std::mem::take(&mut app.pending_images);
+    let images = app.take_pending_image_payloads();
     app.cursor_pos = 0;
     app.clear_input_undo_history();
     PreparedInput {
@@ -3089,6 +3017,51 @@ fn attach_image(app: &mut App, media_type: String, base64_data: String) {
     app.cursor_pos += placeholder.len();
     app.sync_model_picker_preview_from_input();
     app.set_status_notice(format!("Pasted {} ({} KB)", media_type, size_kb));
+}
+
+impl App {
+    /// Removing an attachment marker detaches its payload. Keep empty slots so
+    /// surviving image numbers remain stable and restored text cannot silently
+    /// refer to a different image.
+    pub(super) fn sync_input_image_attachments(&mut self) {
+        let mut removed = 0;
+        if self.pending_images.is_empty() {
+            self.detached_images.clear();
+        }
+        for (index, slot) in self.pending_images.iter_mut().enumerate() {
+            let marked = self.input.contains(&format!("[image {}]", index + 1));
+            if !slot.1.is_empty() && !marked {
+                // Keep the payload: Esc and Ctrl+U promise "Ctrl+Z to restore",
+                // and a restored marker must still carry its image.
+                self.detached_images.insert(index, std::mem::take(slot));
+                removed += 1;
+            } else if slot.1.is_empty()
+                && marked
+                && let Some(payload) = self.detached_images.remove(&index)
+            {
+                *slot = payload;
+            }
+        }
+        if removed > 0 {
+            let remaining = self
+                .pending_images
+                .iter()
+                .filter(|(_, data)| !data.is_empty())
+                .count();
+            self.set_status_notice(format!(
+                "Detached {removed} image{} · {remaining} attached",
+                if removed == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    pub(super) fn take_pending_image_payloads(&mut self) -> Vec<(String, String)> {
+        self.detached_images.clear();
+        std::mem::take(&mut self.pending_images)
+            .into_iter()
+            .filter(|(media_type, data)| !media_type.is_empty() && !data.is_empty())
+            .collect()
+    }
 }
 
 fn paste_placeholder(content: &str) -> String {
@@ -3491,6 +3464,35 @@ impl App {
         self.copy_badge_ui.key_active = Some((key, expiry));
     }
 
+    /// Everything a key *release* can change on screen: the held-modifier and
+    /// held-key copy badges and the voice-input phase. Compared before and
+    /// after a release so releases that change none of it skip the full
+    /// frame. Under kitty's keyboard protocol every keystroke also reports a
+    /// release, which doubled the frames drawn while typing.
+    pub(super) fn key_release_visible_state(
+        &self,
+    ) -> (
+        bool,
+        bool,
+        Option<char>,
+        Option<super::voice_input::VoicePhase>,
+    ) {
+        // Badges render only through the `*_is_active` gates (the held key
+        // only shows under Alt+Shift), so compare those, not raw fields.
+        let now = std::time::Instant::now();
+        let badge = &self.copy_badge_ui;
+        let shift = badge.shift_is_active(now);
+        (
+            badge.alt_is_active(now),
+            shift,
+            badge
+                .key_active
+                .filter(|(_, expires_at)| shift && *expires_at > now)
+                .map(|(c, _)| c.to_ascii_lowercase()),
+            self.voice_input.as_ref().map(|voice| voice.phase),
+        )
+    }
+
     pub(super) fn record_copy_badge_feedback(&mut self, key: char, success: bool) {
         self.copy_badge_ui.copied_feedback = Some(crate::tui::app::CopyBadgeFeedback {
             key,
@@ -3708,7 +3710,7 @@ impl App {
         if self.reasoning_partial_len > 0 {
             self.reasoning_partial_len = 0;
         }
-        self.streaming.streaming_text.push_str(text);
+        self.streaming.streaming_text_mut().push_str(text);
         self.refresh_split_view_if_needed();
     }
 
@@ -3768,7 +3770,7 @@ impl App {
     }
 
     pub(super) fn replace_streaming_text(&mut self, text: String) {
-        self.streaming.streaming_text = text;
+        *self.streaming.streaming_text_mut() = text;
         // The live reasoning tail belonged to the *previous* buffer. Keeping its
         // byte length would make `strip_reasoning_partial_tail` slice at an
         // offset that has no relation to the new contents (and can land
@@ -3781,7 +3783,7 @@ impl App {
     }
 
     pub(super) fn clear_streaming_render_state(&mut self) {
-        self.streaming.streaming_text.clear();
+        self.streaming.streaming_text_mut().clear();
         self.stream_message_ended = false;
         self.deferred_stream_done_id = None;
         self.reasoning_streaming = false;
@@ -3847,7 +3849,7 @@ impl App {
     }
 
     pub(super) fn take_streaming_text(&mut self) -> String {
-        let content = std::mem::take(&mut self.streaming.streaming_text);
+        let content = std::mem::take(self.streaming.streaming_text_mut());
         self.stream_message_ended = false;
         self.deferred_stream_done_id = None;
         self.reasoning_streaming = false;
@@ -4119,6 +4121,8 @@ impl App {
         // Remember the typed prompt so we can restore it to the input box if this
         // turn fails (e.g. "token refresh needed"), instead of dropping it.
         self.last_submitted_input = Some(raw_input.clone());
+        self.automatic_failover_targets.clear();
+        self.automatic_failover_stopped = false;
 
         // See `stage_turn_for_remote_tick_loop`: a remote client must never
         // park on the local-only `pending_turn` flag.
@@ -4135,7 +4139,10 @@ impl App {
             tool_data: None,
         });
         // Send expanded content (with actual pasted text) to model
-        let images = std::mem::take(&mut self.pending_images);
+        let images = self.take_pending_image_payloads();
+        if !images.is_empty() {
+            self.invalidate_side_pane_images_signature();
+        }
         if !images.is_empty() {
             crate::logging::info(&format!(
                 "Submitting with {} image(s): {}",
@@ -4224,7 +4231,9 @@ impl App {
         event_stream: &mut EventStream,
     ) {
         while !self.cloud_handoff_blocks_work()
-            && (!self.queued_messages.is_empty() || !self.hidden_queued_system_messages.is_empty())
+            && (!self.queued_messages.is_empty()
+                || !self.hidden_queued_system_messages.is_empty()
+                || self.has_pending_cloud_recovery())
         {
             // Combine all currently queued messages into one, treating [SYSTEM: ...]
             // startup continuations as system reminders rather than user turns.
@@ -4235,6 +4244,10 @@ impl App {
             let combined = messages.join("\n\n");
             let has_combined = !combined.is_empty();
             let preserve_visible_turn = super::commands::queued_messages_are_only_pokes(&messages);
+            if !messages.is_empty() && !preserve_visible_turn {
+                self.automatic_failover_targets.clear();
+                self.automatic_failover_stopped = false;
+            }
 
             self.commit_pending_streaming_assistant_message();
 
@@ -4355,3 +4368,6 @@ impl App {
 
 #[cfg(test)]
 mod terminal_control_sequence_tests;
+
+#[cfg(test)]
+mod ssh_loop_followup_tests;

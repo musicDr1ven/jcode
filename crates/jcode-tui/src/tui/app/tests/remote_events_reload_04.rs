@@ -52,37 +52,8 @@ fn test_remote_fast_status_tracks_history_tier_including_explicit_off() {
     });
 }
 
-#[test]
-fn test_remote_debug_frame_commands_request_a_fresh_draw() {
-    for command in [
-        "frame",
-        "frame-normalized",
-        "screen",
-        "screen-json",
-        "screen-json-normalized",
-        "layout",
-        "margins",
-        "widgets",
-        "info-widgets",
-        "render-stats",
-        "render-order",
-        "anomalies",
-        "theme",
-    ] {
-        assert!(
-            remote::debug_command_needs_current_frame(command),
-            "{command} should capture the current frame"
-        );
-    }
-
-    for command in ["state", "picker", "memory", "draw-stats", "overlay:on"] {
-        assert!(
-            !remote::debug_command_needs_current_frame(command),
-            "{command} should not force a draw"
-        );
-    }
-}
-
+#[path = "remote_events_reload_04/debug_frames.rs"]
+mod debug_frames;
 #[test]
 fn test_remote_error_without_retry_recovers_pending_followups() {
     let mut app = create_test_app();
@@ -487,36 +458,6 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
 
 include!("remote_failover_routes.rs");
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[test]
 fn test_schedule_pending_remote_retry_respects_retry_limit() {
     let mut app = create_test_app();
@@ -794,7 +735,8 @@ fn test_new_for_remote_uses_startup_stub_without_loading_full_transcript() {
         content: vec![crate::message::ContentBlock::Text {
             text: "hello from persisted history".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -1550,6 +1492,7 @@ fn test_remote_anthropic_api_key_accrues_cost_from_token_usage() {
     // One completed call with split-accounting cache telemetry.
     app.handle_server_event(
         crate::protocol::ServerEvent::TokenUsage {
+            effective_budget: None,
             input: 1_000,
             output: 2_000,
             cache_read_input: Some(40_000),
@@ -1578,6 +1521,7 @@ fn test_remote_anthropic_api_key_accrues_cost_from_token_usage() {
     oauth_app.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
     oauth_app.handle_server_event(
         crate::protocol::ServerEvent::TokenUsage {
+            effective_budget: None,
             input: 1_000,
             output: 2_000,
             cache_read_input: Some(40_000),
@@ -1672,6 +1616,7 @@ fn test_remote_fast_mode_tier_bills_premium_rates_and_reprices_on_toggle() {
     reset_call_state(&mut app);
     app.handle_server_event(
         crate::protocol::ServerEvent::TokenUsage {
+            effective_budget: None,
             input: 1_000,
             output: 1_000,
             cache_read_input: None,
@@ -1690,6 +1635,7 @@ fn test_remote_fast_mode_tier_bills_premium_rates_and_reprices_on_toggle() {
     reset_call_state(&mut app);
     app.handle_server_event(
         crate::protocol::ServerEvent::TokenUsage {
+            effective_budget: None,
             input: 1_000,
             output: 1_000,
             cache_read_input: None,
@@ -1709,6 +1655,7 @@ fn test_remote_fast_mode_tier_bills_premium_rates_and_reprices_on_toggle() {
     let before = app.cost.total_cost;
     app.handle_server_event(
         crate::protocol::ServerEvent::TokenUsage {
+            effective_budget: None,
             input: 1_000,
             output: 1_000,
             cache_read_input: None,

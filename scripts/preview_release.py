@@ -13,6 +13,7 @@ import re
 import subprocess
 
 from check_release_ci import authorize
+from preview_notes import change_notes
 
 REPOSITORY = "1jehuang/jcode"
 ASSETS = tuple(f"jcode-{platform}-{arch}.tar.gz" for platform in ("linux", "macos", "windows")
@@ -49,6 +50,21 @@ def require_head(repository, sha):
         raise ValueError("master advanced, refusing stale preview")
 
 
+def require_snapshot(repository, sha, pinned=False):
+    if not pinned:
+        require_head(repository, sha)
+        return
+    if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+            or os.environ.get("GITHUB_REF") != "refs/heads/master"
+            or os.environ.get("GITHUB_SHA") != sha):
+        raise ValueError("Pinned previews require a manual master dispatch at the requested SHA")
+    head = api(f"repos/{repository}/git/ref/heads/master")["object"]["sha"]
+    if head != sha:
+        comparison = api(f"repos/{repository}/compare/{sha}...{head}")
+        if comparison.get("merge_base_commit", {}).get("sha") != sha:
+            raise ValueError("Pinned preview SHA is not an ancestor of current master")
+
+
 def inventory(directory):
     directory = Path(directory)
     files = {p.name: p for p in directory.iterdir() if p.is_file()}
@@ -59,13 +75,14 @@ def inventory(directory):
     return files
 
 
-def publish(repository, sha, tag, directory):
+def publish(repository, sha, tag, directory, pinned=False):
     validate(repository, sha, tag)
     files = inventory(directory)
     # Recheck CI after the builds as well as before them. No stale/rerun evidence.
-    authorize(repository, sha, timeout=0)
+    authorize(repository, sha, timeout=0, preview=True)
     require_preview_window(repository)
-    require_head(repository, sha)
+    require_snapshot(repository, sha, pinned)
+    changes = change_notes(repository, sha, tag, gh)
     checksum = Path(directory) / "SHA256SUMS"
     checksum.write_text("".join(f"{hashlib.sha256(files[name].read_bytes()).hexdigest()}  {name}\n"
                                 for name in sorted(files)))
@@ -80,6 +97,7 @@ def publish(repository, sha, tag, directory):
     notes = (f"Opt-in v1 preview built from master commit {sha}.\n\n"
              "Experimental binaries, not a stable release. Windows preview binaries are unsigned. "
              "Use the stable channel for production. Preview numbers may have gaps.\n\n"
+             f"{changes}"
              "## First-time preview setup\n\n"
              "Existing stable versions do not support `--channel`. Download the archive for your "
              "OS and architecture from this release, verify it against `SHA256SUMS`, and extract "
@@ -108,7 +126,7 @@ def publish(repository, sha, tag, directory):
         raise ValueError("Preview tag changed during staging")
     require_preview_window(repository)
     # This MUST remain the final check immediately before the visibility change.
-    require_head(repository, sha)
+    require_snapshot(repository, sha, pinned)
     gh("release", "edit", tag, "--repo", repository, "--draft=false", "--prerelease", "--latest=false")
 
 
@@ -119,13 +137,15 @@ def main():
     parser.add_argument("--sha", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--assets", default="dist")
+    parser.add_argument("--pinned", action="store_true",
+                        help="Allow the original manual master snapshot after master advances")
     args = parser.parse_args()
     validate(args.repo, args.sha, args.tag)
     if args.action == "check-head":
         require_preview_window(args.repo)
-        require_head(args.repo, args.sha)
+        require_snapshot(args.repo, args.sha, args.pinned)
     else:
-        publish(args.repo, args.sha, args.tag, args.assets)
+        publish(args.repo, args.sha, args.tag, args.assets, pinned=args.pinned)
 
 
 if __name__ == "__main__":

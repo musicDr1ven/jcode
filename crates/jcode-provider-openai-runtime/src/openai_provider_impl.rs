@@ -12,6 +12,63 @@ fn catalog_error_is_auth_rejection(err: &anyhow::Error) -> bool {
         .is_some_and(|status| status.0 == 401 || status.0 == 403)
 }
 
+#[cfg(test)]
+#[test]
+fn borrowed_request_fingerprint_fields_match_owned_fields() {
+    use jcode_provider_core::fingerprint::stable_hash_json;
+
+    fn fingerprint(value: &Value) -> (u64, usize) {
+        (
+            stable_hash_json(value),
+            serde_json::to_vec(value).unwrap().len(),
+        )
+    }
+
+    for request in [
+        serde_json::json!({}),
+        serde_json::json!({"tools": null, "instructions": null}),
+        serde_json::json!({"tools": [], "instructions": ""}),
+        serde_json::json!({"tools": [{"name": "read", "schema": {"type": "object"}}], "instructions": "日本語\n"}),
+        serde_json::json!({"tools": {"unexpected": true}, "instructions": ["structured"]}),
+    ] {
+        let owned_tools = request
+            .get("tools")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        let owned_instructions = request.get("instructions").cloned();
+        let empty_tools = serde_json::json!([]);
+        let borrowed_tools = request.get("tools").unwrap_or(&empty_tools);
+        let borrowed_instructions = request.get("instructions");
+        assert_eq!(fingerprint(borrowed_tools), fingerprint(&owned_tools));
+        assert_eq!(
+            borrowed_instructions.map(fingerprint),
+            owned_instructions.as_ref().map(fingerprint)
+        );
+        // Full requests fall back to the caller's tool count, continuations to zero.
+        for fallback_count in [0, 7] {
+            assert_eq!(
+                borrowed_tools
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(fallback_count),
+                owned_tools
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(fallback_count)
+            );
+        }
+        if let Some(tools) = request.get("tools") {
+            assert!(std::ptr::eq(borrowed_tools, tools));
+        } else {
+            assert_eq!(borrowed_tools, &serde_json::json!([]));
+        }
+        assert_eq!(
+            borrowed_instructions.is_some(),
+            request.get("instructions").is_some()
+        );
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn set_session_id(&self, session_id: &str) {
@@ -123,63 +180,7 @@ impl Provider for OpenAIProvider {
     }
 
     async fn prewarm(&self, tools: &[ToolDefinition], system: &str) {
-        if self.oauth_account_label().is_some_and(|label| {
-            jcode_base::auth::codex::load_credentials_for_account(&label).is_err()
-        }) {
-            return;
-        }
-        if self.is_browser_only()
-            || is_chatgpt_web_model(&self.model())
-            || std::env::var("JCODE_OPENAI_PREWARM").is_ok_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off"
-                )
-            })
-        {
-            return;
-        }
-        let mode = self
-            .transport_mode
-            .try_read()
-            .map(|mode| *mode)
-            .unwrap_or(OpenAITransportMode::HTTPS);
-        if matches!(mode, OpenAITransportMode::HTTPS) {
-            return;
-        }
-        // An existing response chain is more useful than a speculative prefix.
-        // Never contend with active generation or keepalive for its socket.
-        match self.persistent_ws.try_lock() {
-            Ok(guard) if guard.is_none() => {}
-            _ => return,
-        }
-        // Unlike foreground completion, preparation must not wait for model
-        // discovery or OAuth refresh. A changed/fallback model simply makes
-        // this speculative request incompatible at adoption time.
-        let model = self.model();
-        let model = model.strip_suffix("[1m]").unwrap_or(&model);
-        let Ok(credentials) = self.credentials.try_read() else {
-            return;
-        };
-        let request = self.response_request_for_model(
-            model,
-            &[],
-            tools,
-            system,
-            Self::is_chatgpt_mode(&credentials),
-        );
-        drop(credentials);
-        if matches!(mode, OpenAITransportMode::Auto)
-            && websocket_cooldown_remaining(
-                &self.websocket_cooldowns,
-                &openai_request_model(&request),
-            )
-            .await
-            .is_some()
-        {
-            return;
-        }
-        self.prewarm.start(Arc::clone(&self.credentials), &request);
+        self.prewarm_request(tools, system).await;
     }
 
     async fn complete(
@@ -251,11 +252,9 @@ impl Provider for OpenAIProvider {
         } else {
             self.prewarm.clear();
         }
-        let request_tools = request
-            .get("tools")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-        let request_instructions = request.get("instructions").cloned();
+        let empty_tools = serde_json::json!([]);
+        let request_tools = request.get("tools").unwrap_or(&empty_tools);
+        let request_instructions = request.get("instructions");
         let request_tool_count = request_tools
             .as_array()
             .map(|tools| tools.len())
@@ -283,8 +282,8 @@ impl Provider for OpenAIProvider {
             "openai_responses_full",
             &canonical_payload,
             &input,
-            request_instructions.as_ref(),
-            Some(&request_tools),
+            request_instructions,
+            Some(request_tools),
             Some(request_tool_count),
             &[
                 (
@@ -384,6 +383,8 @@ impl Provider for OpenAIProvider {
 
         tokio::spawn(async move {
             let stream_task = async move {
+                let mut retry_diagnostics =
+                    super::openai_retry_diagnostics::OpenAIRetryDiagnostics::default();
                 // Attempt persistent WebSocket continuation first
                 if use_websocket_transport {
                     // Track output: a continuation that streams partial output
@@ -414,7 +415,7 @@ impl Provider for OpenAIProvider {
                             recover_opaque_ws_rejection(
                                 Arc::clone(&credentials),
                                 account_label.clone(),
-                                request.clone(),
+                                &request,
                                 &tx,
                             )
                             .await;
@@ -477,9 +478,17 @@ impl Provider for OpenAIProvider {
                                     }))
                                     .await;
                             }
+                            if let Some(notice) = retry_diagnostics.record(&err) {
+                                emit_status_detail(&tx, notice).await;
+                            }
                         }
                     }
                 }
+
+                // The retry request already owns the full input. The separate
+                // array is needed only for the continuation attempt above, not
+                // throughout a fresh HTTPS/WS response or its retries.
+                drop(input);
 
                 // Normal path: fresh connection with full input (with retry logic)
                 let mut last_error = None;
@@ -615,7 +624,7 @@ impl Provider for OpenAIProvider {
                             attempt_client,
                             Arc::clone(&credentials),
                             account_label.clone(),
-                            request.clone(),
+                            &request,
                             if force_https_for_request {
                                 let reason = last_error
                                     .as_ref()
@@ -648,7 +657,7 @@ impl Provider for OpenAIProvider {
                             recover_opaque_ws_rejection(
                                 Arc::clone(&credentials),
                                 account_label.clone(),
-                                request.clone(),
+                                &request,
                                 &tx,
                             )
                             .await;
@@ -713,6 +722,9 @@ impl Provider for OpenAIProvider {
                                     .await;
                             }
                             force_https_for_request = true;
+                            if let Some(notice) = retry_diagnostics.record(&format!("{error:#}")) {
+                                emit_status_detail(&tx, notice).await;
+                            }
                             skip_backoff_once = true;
                             if matches!(transport_mode, OpenAITransportMode::Auto) {
                                 let (streak, cooldown) = record_websocket_fallback(
@@ -738,6 +750,7 @@ impl Provider for OpenAIProvider {
                             continue;
                         }
                         Err(OpenAIStreamFailure::Other(error)) => {
+                            let overload_notice = retry_diagnostics.record(&format!("{error:#}"));
                             let elapsed_ms = attempt_started.elapsed().as_millis();
                             // Full anyhow chain ({:#}) so a send-level transport
                             // cause wrapped behind `.context("Failed to send
@@ -769,6 +782,11 @@ impl Provider for OpenAIProvider {
                                         ("elapsed_ms", elapsed_ms.to_string()),
                                     ],
                                 );
+                                // A durable UI notice is a transcript fence. It
+                                // must follow rollback of this failed attempt.
+                                if let Some(notice) = overload_notice {
+                                    emit_status_detail(&tx, notice).await;
+                                }
                                 jcode_base::logging::info(&format!(
                                     "Transient error after {}ms, will retry: {}",
                                     elapsed_ms, error
@@ -792,6 +810,9 @@ impl Provider for OpenAIProvider {
                                     ("elapsed_ms", elapsed_ms.to_string()),
                                 ],
                             );
+                            if let Some(notice) = overload_notice {
+                                emit_status_detail(&tx, notice).await;
+                            }
                             // A tool schema OpenAI rejects fails every turn, not
                             // just this one, and one bad construct invalidates
                             // the whole catalog (#446, #543, #687, #711, #713).
@@ -813,7 +834,7 @@ impl Provider for OpenAIProvider {
                                 }
                                 None => error,
                             };
-                            let _ = tx.send(Err(error)).await;
+                            let _ = tx.send(Err(retry_diagnostics.annotate(error))).await;
                             return;
                         }
                     }
@@ -831,11 +852,11 @@ impl Provider for OpenAIProvider {
                         ],
                     );
                     let _ = tx
-                        .send(Err(anyhow::anyhow!(
+                        .send(Err(retry_diagnostics.annotate(anyhow::anyhow!(
                             "Failed after {} retries: {}",
                             MAX_RETRIES,
                             e
-                        )))
+                        ))))
                         .await;
                 }
             };

@@ -165,6 +165,7 @@ pub use auth::{
 pub use client::{
     AssistantTextMessage, ConnectOptions, CreateSessionOptions, EventStream, FileContent,
     FileStatus, GlobalEventStream, GlobalEventsOptions, JcodeClient, RunOptions, RuntimeInfo,
+    ProviderProfileSpec,
     SearchTextOptions, ToolCall, Transport, TurnResult, UnixTransport, Usage,
 };
 pub use diagnostics::{SocketState, Stage, describe_disconnect, explain, human_duration};

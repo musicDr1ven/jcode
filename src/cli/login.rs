@@ -21,6 +21,20 @@ mod scriptable;
 use google::*;
 use scriptable::*;
 
+/// Read a one-line API key from stdin for `jcode login --api-key-stdin`.
+///
+/// Keeps the secret off the process command line. Empty input fails so a
+/// mis-wired pipe cannot silently store an empty credential.
+pub(crate) fn read_api_key_stdin(mut reader: impl std::io::Read) -> anyhow::Result<String> {
+    let mut input = String::new();
+    reader.read_to_string(&mut input)?;
+    let key = input.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!("--api-key-stdin was set, but stdin was empty");
+    }
+    Ok(key)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LoginOptions {
     pub no_browser: bool,
@@ -1199,3 +1213,17 @@ fn maybe_open_browser(target: &str, no_browser: bool) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stdin_key_tests {
+    use super::*;
+
+    #[test]
+    fn api_key_stdin_trims_and_rejects_empty() {
+        assert_eq!(
+            read_api_key_stdin(std::io::Cursor::new(b"  secret-key \n")).unwrap(),
+            "secret-key"
+        );
+        assert!(read_api_key_stdin(std::io::Cursor::new(b"  \n")).is_err());
+    }
+}

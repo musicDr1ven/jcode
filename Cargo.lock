@@ -3800,6 +3800,7 @@ dependencies = [
  "jcode-provider-openai",
  "jcode-provider-openrouter",
  "jcode-provider-openrouter-runtime",
+ "jcode-provider-setup",
  "jcode-render-core",
  "jcode-selfdev-types",
  "jcode-session-types",
@@ -3986,7 +3987,10 @@ dependencies = [
  "anyhow",
  "jcode-background-types",
  "jcode-base",
+ "jcode-config-types",
  "jcode-harness-api",
+ "jcode-provider-metadata",
+ "jcode-provider-setup",
  "jcode-session-types",
  "jcode-todo-policy",
  "jcode-transport",
@@ -4459,6 +4463,21 @@ dependencies = [
  "tokio-stream",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "jcode-provider-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jcode-config-types",
+ "jcode-provider-env",
+ "jcode-provider-metadata",
+ "jcode-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

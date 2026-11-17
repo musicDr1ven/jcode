@@ -69,6 +69,7 @@ jcode-azure-auth = { path = "../jcode-azure-auth" }
 jcode-agent-runtime = { path = "../jcode-agent-runtime" }
 jcode-provider-metadata = { path = "../jcode-provider-metadata" }
 jcode-provider-env = { path = "../jcode-provider-env" }
+jcode-provider-setup = { path = "../jcode-provider-setup" }
 jcode-provider-core = { path = "../jcode-provider-core" }
 # default-features=false so this crate's `bedrock` feature (below) controls the
 # AWS SDK stack; the pure model-metadata/credential-detection layer is always on.

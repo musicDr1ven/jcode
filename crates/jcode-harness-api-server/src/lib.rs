@@ -395,6 +395,7 @@ where
                 "persisted_session_discovery",
                 "runtime_info",
                 "api_key_provisioning",
+                "provider_admin",
                 "auth_changed_notification",
                 "usage_invalidation",
                 "session_archive",

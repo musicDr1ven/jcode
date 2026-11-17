@@ -343,8 +343,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             google,
             api_base,
             api_key,
+            api_key_stdin,
             api_key_env,
         }) => {
+            let api_key = if api_key_stdin {
+                Some(login::read_api_key_stdin(std::io::stdin())?)
+            } else {
+                api_key
+            };
             let mut options = login::LoginOptions {
                 no_browser,
                 print_auth_url,
@@ -462,6 +468,12 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     overwrite,
                     provider_routing,
                     model_catalog,
+                    json,
+                })?;
+            }
+            ProviderCommand::Remove { name, json } => {
+                commands::run_provider_remove_command(commands::ProviderRemoveOptions {
+                    name,
                     json,
                 })?;
             }

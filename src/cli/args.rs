@@ -286,6 +286,10 @@ pub(crate) enum Command {
         /// Environment variable name to store/use for an OpenAI-compatible API key.
         #[arg(long)]
         api_key_env: Option<String>,
+
+        /// Read the OpenAI-compatible API key from stdin, keeping it out of shell history.
+        #[arg(long, conflicts_with = "api_key")]
+        api_key_stdin: bool,
     },
 
     /// Log in to and manage your Jcode account
@@ -1261,6 +1265,16 @@ pub(crate) enum ProviderCommand {
         model_catalog: bool,
 
         /// Emit JSON instead of human-readable setup output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a user-created named OpenAI-compatible provider profile
+    Remove {
+        /// Profile name to remove (built-in provider ids are refused)
+        name: String,
+
+        /// Emit JSON instead of human-readable removal output
         #[arg(long)]
         json: bool,
     },

@@ -107,3 +107,25 @@ pub struct Usage {
     pub cache_creation_input: Option<u64>,
     pub effective_budget: Option<usize>,
 }
+
+/// A named OpenAI-compatible provider profile to create or replace on the
+/// runtime host. Only `name`, `base_url`, and `model` are required.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderProfileSpec {
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub context_window: Option<usize>,
+    pub api_key_env: Option<String>,
+    /// One-line API key stored in Jcode's owner-only env file. Never logged.
+    pub api_key: Option<String>,
+    pub env_file: Option<String>,
+    pub no_api_key: bool,
+    /// `bearer` (default), `header`, or `none`.
+    pub auth: Option<String>,
+    pub auth_header: Option<String>,
+    pub set_default: bool,
+    pub overwrite: bool,
+    pub provider_routing: bool,
+    pub model_catalog: bool,
+}

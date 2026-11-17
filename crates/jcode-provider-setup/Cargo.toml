@@ -1,0 +1,19 @@
+[package]
+name = "jcode-provider-setup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Create and remove named OpenAI-compatible provider profiles"
+
+[dependencies]
+anyhow = "1"
+jcode-config-types = { path = "../jcode-config-types" }
+jcode-provider-env = { path = "../jcode-provider-env" }
+jcode-provider-metadata = { path = "../jcode-provider-metadata" }
+jcode-storage = { path = "../jcode-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

@@ -57,6 +57,8 @@ const CAPABILITIES: &[Capability] = &[
     cap("runtime_command", "runtimeCommand"),
     cap("set_api_key", "setApiKey"),
     cap("clear_api_key", "clearApiKey"),
+    cap("add_provider_profile", "addProviderProfile"),
+    cap("remove_provider_profile", "removeProviderProfile"),
     cap("notify_auth_changed", "notifyAuthChanged"),
     cap("invalidate_usage", "invalidateUsage"),
     cap("read_file", "readFile"),

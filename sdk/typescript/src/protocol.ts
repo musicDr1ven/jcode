@@ -204,6 +204,24 @@ export type ApiRequest =
   | { req: "notify_auth_changed"; provider: string }
   | { req: "invalidate_usage"; provider: string; account_label?: string }
   | { req: "clear_api_key"; provider: string }
+  | {
+      req: "provider_add";
+      name: string;
+      base_url: string;
+      model: string;
+      context_window?: number;
+      api_key_env?: string;
+      api_key?: string;
+      env_file?: string;
+      no_api_key?: boolean;
+      auth?: "bearer" | "header" | "none";
+      auth_header?: string;
+      set_default?: boolean;
+      overwrite?: boolean;
+      provider_routing?: boolean;
+      model_catalog?: boolean;
+    }
+  | { req: "provider_remove"; name: string }
   | { req: "read_file"; session_id: string; path: string; max_bytes?: number }
   | { req: "find_files"; session_id: string; query: string; limit?: number }
   | { req: "search_text"; session_id: string; query: string; path?: string; limit?: number }
@@ -544,6 +562,8 @@ export const KNOWN_REQUEST_KINDS = [
   "get_runtime_info",
   "set_api_key",
   "clear_api_key",
+  "provider_add",
+  "provider_remove",
   "notify_auth_changed",
   "invalidate_usage",
   "read_file",

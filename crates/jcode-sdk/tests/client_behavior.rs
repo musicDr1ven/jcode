@@ -60,6 +60,16 @@ fn session(id: &str) -> SessionInfo {
 /// Start a fake harness on one end of a socket pair. `handle` is called for
 /// every client frame with a writer for replies.
 fn fake_harness(handle: impl Fn(&ClientFrame, &mut dyn Write) + Send + 'static) -> JcodeClient {
+    fake_harness_with_capabilities(handle, &["sessions"])
+}
+
+/// Same as [`fake_harness`], but the handshake advertises `capabilities`, so a
+/// test can exercise capability-gated client methods.
+fn fake_harness_with_capabilities(
+    handle: impl Fn(&ClientFrame, &mut dyn Write) + Send + 'static,
+    capabilities: &[&str],
+) -> JcodeClient {
+    let capabilities: Vec<String> = capabilities.iter().map(|cap| (*cap).to_string()).collect();
     let (ours, theirs) = UnixStream::pair().expect("socket pair");
     std::thread::spawn(move || {
         let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
@@ -73,7 +83,7 @@ fn fake_harness(handle: impl Fn(&ClientFrame, &mut dyn Write) + Send + 'static) 
                     event: ApiEvent::HelloOk {
                         version: API_VERSION_MAJOR,
                         server: "fake-harness/1.0".to_string(),
-                        capabilities: vec!["sessions".to_string()],
+                        capabilities: capabilities.clone(),
                     },
                 };
                 write_frame(&mut writer, &reply).expect("hello reply");
@@ -129,6 +139,9 @@ mod soft_interrupt_tests;
 
 #[path = "client_behavior/runtime_and_files.rs"]
 mod runtime_and_files;
+
+#[path = "client_behavior/provider_admin.rs"]
+mod provider_admin;
 
 /// Replies must go to the request that asked for them, not to whichever one
 /// happens to be waiting. Answered out of order on purpose: in-order delivery

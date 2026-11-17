@@ -20,24 +20,11 @@ pub use profile_credentials::{
     openai_compatible_profile_is_configured,
 };
 
-pub fn api_base_uses_localhost(raw: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(raw) else {
-        return false;
-    };
-
-    let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) else {
-        return false;
-    };
-
-    if host == "localhost" || host.ends_with(".local") {
-        return true;
-    }
-
-    // A bare IP names one machine, like loopback: a self-hosted inference
-    // server reached by address needs no key by default, whether that address
-    // is private or public.
-    ip_addr_from_host(&host).is_some()
-}
+pub use jcode_provider_setup::{
+    NamedProviderCredential, ProviderProfileRemovalReport, ProviderProfileReport,
+    ProviderProfileSetup, configure_provider_profile, named_provider_profile,
+    remove_provider_profile,
+};
 
 pub fn resolve_openai_compatible_profile(
     profile: OpenAiCompatibleProfile,

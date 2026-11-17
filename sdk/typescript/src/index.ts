@@ -32,6 +32,7 @@ export type {
   FileContent,
   FileStatus,
   GlobalEventsOptions,
+  ProviderProfileSpec,
   RunOptions,
   RunStructuredOptions,
   RuntimeInfo,

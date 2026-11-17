@@ -39,6 +39,8 @@ pub enum ErrorKind {
     InvalidOption,
     /// An operation requires a reconnectable native socket or SSH transport.
     UnsupportedTransport,
+    /// The connected runtime does not advertise the capability this operation needs.
+    UnsupportedCapability,
     /// A global event consumer fell behind its bounded queue.
     EventBufferOverflow,
     /// The caller cancelled a long-running operation (sign-in, host wake).
@@ -70,6 +72,7 @@ impl ErrorKind {
             Self::InvalidInstanceHome => "invalid_instance_home",
             Self::InvalidOption => "invalid_option",
             Self::UnsupportedTransport => "unsupported_transport",
+            Self::UnsupportedCapability => "unsupported_capability",
             Self::EventBufferOverflow => "event_buffer_overflow",
             Self::Cancelled => "cancelled",
             Self::CloudAuth => "cloud_auth",

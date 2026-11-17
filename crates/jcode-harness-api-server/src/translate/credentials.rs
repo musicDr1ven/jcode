@@ -1,35 +1,89 @@
 //! Secure credential binding and atomic owner-only persistence.
 
 use super::*;
+use jcode_provider_metadata::{
+    is_safe_env_file_name, is_safe_env_key_name, openai_compatible_profiles,
+};
+
+/// Where a provider's API key lives: the canonical provider id plus the env
+/// keys and file that `jcode auth status` reads back.
+pub(super) struct CredentialBinding {
+    pub provider: String,
+    pub env_keys: Vec<String>,
+    pub file_name: String,
+}
 
 impl BridgeState {
-    pub(super) fn credential_binding(
-        provider: &str,
-    ) -> Option<(&'static str, &'static [&'static str], &'static str)> {
-        match provider.trim().to_ascii_lowercase().as_str() {
+    /// Resolve an API-key provider to its credential file.
+    ///
+    /// Built-in ids keep their historical env keys (Gemini owns two). Named
+    /// `[providers.<name>]` profiles resolve from the runtime config, and
+    /// preset OpenAI-compatible profiles resolve from provider metadata.
+    pub(super) fn credential_binding(provider: &str) -> Option<CredentialBinding> {
+        let raw = provider.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let normalized = raw.to_ascii_lowercase();
+        if let Some(binding) = Self::builtin_credential_binding(&normalized) {
+            return Some(binding);
+        }
+
+        let profile_name = raw.strip_prefix("openai-compatible:").unwrap_or(raw);
+        if let Some(profile) = jcode_provider_setup::named_provider_profile(profile_name) {
+            return Some(CredentialBinding {
+                provider: profile.name,
+                env_keys: vec![profile.api_key_env],
+                file_name: profile.env_file,
+            });
+        }
+
+        let preset = openai_compatible_profiles()
+            .iter()
+            .find(|profile| profile.id == profile_name)?;
+        if !is_safe_env_key_name(preset.api_key_env) || !is_safe_env_file_name(preset.env_file) {
+            return None;
+        }
+        Some(CredentialBinding {
+            provider: preset.id.to_string(),
+            env_keys: vec![preset.api_key_env.to_string()],
+            file_name: preset.env_file.to_string(),
+        })
+    }
+
+    /// Canonical built-in ids whose credential location predates the metadata
+    /// catalog. Kept exact so alias normalization and Gemini's two env keys do
+    /// not change.
+    fn builtin_credential_binding(provider: &str) -> Option<CredentialBinding> {
+        let (id, env_keys, file_name): (&str, &[&str], &str) = match provider {
             "claude-api" | "anthropic-api" | "anthropic-key" | "claude-key" => {
-                Some(("claude-api", &["ANTHROPIC_API_KEY"], "anthropic.env"))
+                ("claude-api", &["ANTHROPIC_API_KEY"], "anthropic.env")
             }
             "openai-api" | "openai-key" | "openai-apikey" => {
-                Some(("openai-api", &["OPENAI_API_KEY"], "openai.env"))
+                ("openai-api", &["OPENAI_API_KEY"], "openai.env")
             }
-            "openrouter" => Some(("openrouter", &["OPENROUTER_API_KEY"], "openrouter.env")),
-            "cursor" => Some(("cursor", &["CURSOR_API_KEY"], "cursor.env")),
-            "gemini" | "gemini-api" | "google-gemini" => Some((
+            "openrouter" => ("openrouter", &["OPENROUTER_API_KEY"], "openrouter.env"),
+            "cursor" => ("cursor", &["CURSOR_API_KEY"], "cursor.env"),
+            "gemini" | "gemini-api" | "google-gemini" => (
                 "gemini",
                 &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
                 "gemini.env",
-            )),
+            ),
             "jcode" | "subscription" | "jcode-subscription" => {
-                Some(("jcode", &["JCODE_API_KEY"], "jcode-subscription.env"))
+                ("jcode", &["JCODE_API_KEY"], "jcode-subscription.env")
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some(CredentialBinding {
+            provider: id.to_string(),
+            env_keys: env_keys.iter().map(|key| (*key).to_string()).collect(),
+            file_name: file_name.to_string(),
+        })
     }
 
     pub(super) fn write_credential(
         file_name: &str,
-        env_keys: &[&str],
+        env_keys: &[String],
         value: Option<&str>,
     ) -> Result<(), String> {
         let _write_guard = Self::state_write_guard();
@@ -47,7 +101,7 @@ impl BridgeState {
             .lines()
             .filter(|line| {
                 line.split_once('=')
-                    .is_none_or(|(key, _)| !env_keys.contains(&key.trim()))
+                    .is_none_or(|(key, _)| !env_keys.iter().any(|candidate| candidate == key.trim()))
             })
             .map(str::to_string)
             .collect();

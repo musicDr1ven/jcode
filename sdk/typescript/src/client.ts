@@ -141,6 +141,25 @@ function connectError(socketPath: string, cause: NodeJS.ErrnoException): Harness
   return error;
 }
 
+/** A named OpenAI-compatible provider profile to create or replace. */
+export interface ProviderProfileSpec {
+  name: string;
+  baseUrl: string;
+  model: string;
+  contextWindow?: number;
+  apiKeyEnv?: string;
+  /** One-line API key stored in Jcode's owner-only env file. Never logged. */
+  apiKey?: string;
+  envFile?: string;
+  noApiKey?: boolean;
+  auth?: "bearer" | "header" | "none";
+  authHeader?: string;
+  setDefault?: boolean;
+  overwrite?: boolean;
+  providerRouting?: boolean;
+  modelCatalog?: boolean;
+}
+
 export interface ConnectOptions {
   /** Defaults to the resolved harness API socket path. */
   socketPath?: string;
@@ -833,6 +852,51 @@ export class JcodeClient extends EventEmitter {
 
   async clearApiKey(provider: string): Promise<void> {
     await this.expectReply({ req: "clear_api_key", provider }, "credential_updated");
+  }
+
+  /**
+   * Create or replace a named OpenAI-compatible provider profile on the
+   * runtime host. Requires the `provider_admin` capability.
+   */
+  async addProviderProfile(profile: ProviderProfileSpec): Promise<void> {
+    this.requireProviderAdmin();
+    await this.expectReply(
+      {
+        req: "provider_add",
+        name: profile.name,
+        base_url: profile.baseUrl,
+        model: profile.model,
+        context_window: profile.contextWindow,
+        api_key_env: profile.apiKeyEnv,
+        api_key: profile.apiKey,
+        env_file: profile.envFile,
+        no_api_key: profile.noApiKey,
+        auth: profile.auth,
+        auth_header: profile.authHeader,
+        set_default: profile.setDefault,
+        overwrite: profile.overwrite,
+        provider_routing: profile.providerRouting,
+        model_catalog: profile.modelCatalog,
+      },
+      "ok",
+    );
+  }
+
+  /**
+   * Remove a user-created named provider profile and its stored key.
+   * Requires the `provider_admin` capability; built-ins are refused.
+   */
+  async removeProviderProfile(name: string): Promise<void> {
+    this.requireProviderAdmin();
+    await this.expectReply({ req: "provider_remove", name }, "ok");
+  }
+
+  private requireProviderAdmin(): void {
+    if (this.supports("provider_admin")) return;
+    throw new HarnessError(
+      "unsupported_capability",
+      "this runtime does not support provider administration; update it, or run `jcode provider add` on the runtime host",
+    );
   }
 
   /** Reload credentials saved by an out-of-band OAuth login. No secrets or chat messages. */

@@ -630,6 +630,7 @@ fn login_no_browser_flag_parses() {
             google,
             api_base,
             api_key,
+            api_key_stdin,
             api_key_env,
             no_validate,
             flow_id,
@@ -651,6 +652,7 @@ fn login_no_browser_flag_parses() {
             assert!(google.google_client_json.is_none());
             assert!(api_base.is_none());
             assert!(api_key.is_none());
+            assert!(!api_key_stdin);
             assert!(api_key_env.is_none());
             assert!(!no_validate);
             assert!(flow_id.is_none());
@@ -663,6 +665,33 @@ fn login_no_browser_flag_parses() {
     match args.command {
         Some(Command::Login { no_browser, .. }) => assert!(no_browser),
         other => panic!("unexpected command: {:?}", other),
+    }
+}
+
+#[test]
+fn login_api_key_stdin_parses_and_conflicts_with_api_key() {
+    let args = Args::try_parse_from(["jcode", "login", "--api-key-stdin"]).unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Command::Login {
+            api_key_stdin: true,
+            ..
+        })
+    ));
+    assert!(
+        Args::try_parse_from(["jcode", "login", "--api-key-stdin", "--api-key", "x"]).is_err()
+    );
+}
+
+#[test]
+fn provider_remove_parses_name_and_json() {
+    let args = Args::try_parse_from(["jcode", "provider", "remove", "my-gw", "--json"]).unwrap();
+    match args.command {
+        Some(Command::Provider(ProviderCommand::Remove { name, json })) => {
+            assert_eq!(name, "my-gw");
+            assert!(json);
+        }
+        other => panic!("unexpected command: {other:?}"),
     }
 }
 

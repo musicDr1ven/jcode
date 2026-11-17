@@ -8,6 +8,9 @@ description = "Harness API endpoint: bridges versioned API clients onto the inte
 [dependencies]
 anyhow = "1"
 jcode-harness-api = { path = "../jcode-harness-api" }
+jcode-config-types = { path = "../jcode-config-types" }
+jcode-provider-metadata = { path = "../jcode-provider-metadata" }
+jcode-provider-setup = { path = "../jcode-provider-setup" }
 jcode-todo-policy = { path = "../jcode-todo-policy" }
 jcode-session-types = { path = "../jcode-session-types" }
 jcode-transport = { path = "../jcode-transport" }

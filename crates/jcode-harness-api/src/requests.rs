@@ -199,6 +199,46 @@ pub enum ApiRequest {
     /// Remove a previously persisted API-key credential.
     ClearApiKey { provider: String },
 
+    /// Create or replace a named OpenAI-compatible provider profile.
+    ///
+    /// Runs the same validation and file layout as `jcode provider add` on the
+    /// runtime host. Built-in provider ids are refused. Requires the
+    /// `provider_admin` capability.
+    ProviderAdd {
+        name: String,
+        base_url: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// One-line API key value. Stored in an owner-only env file and never
+        /// echoed back in events or errors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_file: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_api_key: bool,
+        /// Explicit auth mode: `bearer` (default), `header`, or `none`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_header: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        set_default: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        overwrite: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provider_routing: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_catalog: bool,
+    },
+
+    /// Remove a user-created named provider profile and its stored key.
+    /// Built-in provider ids are refused. Requires `provider_admin`.
+    ProviderRemove { name: String },
+
     /// Reload provider credentials already saved outside the harness (e.g. OAuth).
     /// No tokens or callback input travel in this request.
     NotifyAuthChanged { provider: String },

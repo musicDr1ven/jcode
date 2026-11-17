@@ -291,6 +291,24 @@ fn allows_insecure_http_host(host: &str) -> bool {
     ip_addr_from_host(&host_lower).is_some()
 }
 
+/// Whether an OpenAI-compatible base URL points at a local endpoint, where a
+/// missing API key is not an error by default.
+pub fn api_base_uses_localhost(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+    if host == "localhost" || host.ends_with(".local") {
+        return true;
+    }
+    // A bare IP names one machine, like loopback: a self-hosted inference
+    // server reached by address needs no key by default, whether that address
+    // is private or public.
+    ip_addr_from_host(&host).is_some()
+}
+
 /// Parse a URL host as an IP literal, tolerating brackets and an IPv6 zone id
 /// (`[fe80::1%25eth0]` becomes `fe80::1`, which `IpAddr` cannot parse itself).
 pub fn ip_addr_from_host(host: &str) -> Option<std::net::IpAddr> {

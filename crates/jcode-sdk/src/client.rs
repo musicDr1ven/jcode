@@ -27,6 +27,9 @@ use std::sync::mpsc::{
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// Capability advertised by runtimes that accept provider add/remove requests.
+pub const PROVIDER_ADMIN_CAPABILITY: &str = "provider_admin";
+
 /// How a client reaches the harness.
 pub struct ConnectOptions {
     /// Defaults to the resolved harness API socket path.
@@ -357,7 +360,7 @@ pub struct JcodeClient {
     instance: Option<Arc<LaunchedInstance>>,
     /// State directory of the private instance this client owns, if any.
     pub instance_home: Option<std::path::PathBuf>,
-    /// Server identity from the handshake, e.g. "jcode-harness-api-bridge/0.1.0".
+/// Server identity from the handshake, e.g. "jcode-harness-api-bridge/0.1.0".
     pub server: String,
     /// Capability strings advertised by the server.
     pub capabilities: Vec<String>,
@@ -1195,6 +1198,63 @@ impl JcodeClient {
             ApiEvent::CredentialUpdated { .. } => Ok(()),
             other => Err(unexpected("credential_updated", &other)),
         }
+    }
+
+    /// Create or replace a named OpenAI-compatible provider profile on the
+    /// runtime host. Requires the `provider_admin` capability.
+    pub fn add_provider_profile(&self, profile: ProviderProfileSpec) -> Result<()> {
+        self.require_provider_admin()?;
+        match self
+            .request_ok(ApiRequest::ProviderAdd {
+                name: profile.name,
+                base_url: profile.base_url,
+                model: profile.model,
+                context_window: profile.context_window,
+                api_key_env: profile.api_key_env,
+                api_key: profile.api_key,
+                env_file: profile.env_file,
+                no_api_key: profile.no_api_key,
+                auth: profile.auth,
+                auth_header: profile.auth_header,
+                set_default: profile.set_default,
+                overwrite: profile.overwrite,
+                provider_routing: profile.provider_routing,
+                model_catalog: profile.model_catalog,
+            })?
+            .event
+        {
+            ApiEvent::Ok => Ok(()),
+            other => Err(unexpected("ok", &other)),
+        }
+    }
+
+    /// Remove a user-created named provider profile and its stored key.
+    /// Requires the `provider_admin` capability; built-in providers are
+    /// refused by the runtime.
+    pub fn remove_provider_profile(&self, name: &str) -> Result<()> {
+        self.require_provider_admin()?;
+        match self
+            .request_ok(ApiRequest::ProviderRemove {
+                name: name.to_string(),
+            })?
+            .event
+        {
+            ApiEvent::Ok => Ok(()),
+            other => Err(unexpected("ok", &other)),
+        }
+    }
+
+    /// Fail before sending a provider-admin request to a runtime that cannot
+    /// implement it, so callers get one actionable error instead of a generic
+    /// unknown-request failure.
+    fn require_provider_admin(&self) -> Result<()> {
+        if self.supports(PROVIDER_ADMIN_CAPABILITY) {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::UnsupportedCapability,
+            "this runtime does not support provider administration; update it, or run `jcode provider add` on the runtime host",
+        ))
     }
 
     /// Read one UTF-8 file under the session working directory.

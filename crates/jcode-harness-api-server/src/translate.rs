@@ -1001,14 +1001,98 @@ impl BridgeState {
                     "type": legacy_type, "id": id, "account_label": account_label
                 }))]
             }
+            "provider_add" => {
+                let auth = match request["auth"].as_str() {
+                    None | Some("") => None,
+                    Some("bearer") => Some(jcode_config_types::NamedProviderAuth::Bearer),
+                    Some("header") | Some("api-key") => {
+                        Some(jcode_config_types::NamedProviderAuth::Header)
+                    }
+                    Some("none") => Some(jcode_config_types::NamedProviderAuth::None),
+                    Some(other) => {
+                        return Self::error_reply(
+                            api_id,
+                            ErrorCode::InvalidRequest,
+                            &format!("unsupported auth mode '{other}'; use bearer, header, or none"),
+                        );
+                    }
+                };
+                let options = jcode_provider_setup::ProviderProfileSetup {
+                    name: request["name"].as_str().unwrap_or("").to_string(),
+                    base_url: request["base_url"].as_str().unwrap_or("").to_string(),
+                    model: request["model"].as_str().unwrap_or("").to_string(),
+                    context_window: request["context_window"]
+                        .as_u64()
+                        .map(|value| value as usize),
+                    api_key_env: request["api_key_env"].as_str().map(str::to_string),
+                    api_key: request["api_key"].as_str().map(str::to_string),
+                    no_api_key: request["no_api_key"].as_bool().unwrap_or(false),
+                    auth,
+                    auth_header: request["auth_header"].as_str().map(str::to_string),
+                    env_file: request["env_file"].as_str().map(str::to_string),
+                    set_default: request["set_default"].as_bool().unwrap_or(false),
+                    overwrite: request["overwrite"].as_bool().unwrap_or(false),
+                    provider_routing: request["provider_routing"].as_bool().unwrap_or(false),
+                    model_catalog: request["model_catalog"].as_bool().unwrap_or(false),
+                };
+                let report =
+                    match jcode_provider_setup::configure_provider_profile(options) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            return Self::error_reply(
+                                api_id,
+                                ErrorCode::InvalidRequest,
+                                &error.to_string(),
+                            );
+                        }
+                    };
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                let provider = report.profile;
+                vec![Outbound::Legacy(json!({
+                    "type": "notify_auth_changed",
+                    "id": id,
+                    "provider": provider.clone(),
+                    "auth": {
+                        "provider": provider,
+                        "credential_source": "config_file",
+                        "auth_method": "provider_profile"
+                    }
+                }))]
+            }
+            "provider_remove" => {
+                let name = request["name"].as_str().unwrap_or("");
+                let report = match jcode_provider_setup::remove_provider_profile(name) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return Self::error_reply(
+                            api_id,
+                            ErrorCode::InvalidRequest,
+                            &error.to_string(),
+                        );
+                    }
+                };
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                let provider = report.profile;
+                vec![Outbound::Legacy(json!({
+                    "type": "notify_auth_changed",
+                    "id": id,
+                    "provider": provider.clone(),
+                    "auth": {
+                        "provider": provider,
+                        "credential_source": "config_file",
+                        "auth_method": "provider_profile"
+                    }
+                }))]
+            }
             "set_api_key" | "clear_api_key" => {
                 let provider = request["provider"].as_str().unwrap_or("");
-                let Some((provider, env_keys, file_name)) = Self::credential_binding(provider)
-                else {
+                let Some(binding) = Self::credential_binding(provider) else {
                     return Self::error_reply(
                         api_id,
                         ErrorCode::InvalidRequest,
-                        "unsupported API-key provider; supported: claude-api, openai-api, openrouter, cursor, gemini, jcode",
+                        "unsupported API-key provider; it has no API-key credential file",
                     );
                 };
                 let configured = req == "set_api_key";
@@ -1024,9 +1108,11 @@ impl BridgeState {
                         "api_key must be a non-empty, trimmed, non-NUL single line",
                     );
                 }
-                if let Err(message) =
-                    Self::write_credential(file_name, env_keys, configured.then_some(key))
-                {
+                if let Err(message) = Self::write_credential(
+                    &binding.file_name,
+                    &binding.env_keys,
+                    configured.then_some(key),
+                ) {
                     return Self::error_reply(api_id, ErrorCode::Internal, &message);
                 }
                 let id = self.legacy_id();
@@ -1034,14 +1120,15 @@ impl BridgeState {
                     id,
                     api_id,
                     SimpleKind::Credential {
-                        provider: provider.to_string(),
+                        provider: binding.provider.clone(),
                         configured,
                     },
                 ));
+                let provider = binding.provider;
                 vec![Outbound::Legacy(json!({
                     "type": "notify_auth_changed",
                     "id": id,
-                    "provider": provider,
+                    "provider": provider.clone(),
                     "auth": {
                         "provider": provider,
                         "credential_source": "api_key_file",

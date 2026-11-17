@@ -4150,3 +4150,159 @@ fn account_label_follows_the_daemons_routed_account() {
     state.note_models(&json!({"provider_oauth_account_label": null}));
     assert!(state.current_account.is_none());
 }
+
+#[test]
+fn credential_provisioning_keeps_builtin_bindings() {
+    let home = ScopedJcodeHome::new("credential-builtins");
+    let mut state = BridgeState::default();
+    let overrides: &[(&str, &str, &str)] = &[
+        ("claude-api", "anthropic.env", "ANTHROPIC_API_KEY"),
+        ("openai-api", "openai.env", "OPENAI_API_KEY"),
+        ("openrouter", "openrouter.env", "OPENROUTER_API_KEY"),
+        ("cursor", "cursor.env", "CURSOR_API_KEY"),
+        ("gemini", "gemini.env", "GEMINI_API_KEY"),
+        ("jcode", "jcode-subscription.env", "JCODE_API_KEY"),
+    ];
+    for (index, (provider, file_name, env_key)) in overrides.iter().enumerate() {
+        let outbound = state.api_request_to_legacy(&json!({
+            "req": "set_api_key",
+            "id": 40 + index,
+            "provider": provider,
+            "api_key": "key-value"
+        }));
+        let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+            panic!("{provider} should resolve to a credential file: {outbound:?}");
+        };
+        let content =
+            std::fs::read_to_string(home.path.join("config/jcode").join(file_name)).unwrap();
+        assert!(
+            content.contains(&format!("{env_key}=key-value")),
+            "{provider}: {content}"
+        );
+        assert_eq!(notify["auth"]["credential_source"], "api_key_file");
+    }
+}
+
+#[test]
+fn credential_provisioning_supports_named_profiles_and_compatible_presets() {
+    let home = ScopedJcodeHome::new("credential-profiles");
+    let config_dir = home.path.join("config/jcode");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        home.path.join("config.toml"),
+        r#"[providers.my-gw]
+type = "openai-compatible"
+base_url = "https://llm.example.com/v1"
+auth = "bearer"
+api_key_env = "MY_GW_API_KEY"
+env_file = "provider-my-gw.env"
+default_model = "model-a"
+requires_api_key = true
+"#,
+    )
+    .unwrap();
+
+    let mut state = BridgeState::default();
+    let outbound = state.api_request_to_legacy(&json!({
+        "req": "set_api_key",
+        "id": 51,
+        "provider": "my-gw",
+        "api_key": "gw-secret"
+    }));
+    let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+        panic!("named profile credential should notify the daemon: {outbound:?}");
+    };
+    assert_eq!(notify["provider"], "my-gw");
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("provider-my-gw.env")).unwrap(),
+        "MY_GW_API_KEY=gw-secret\n"
+    );
+
+    let outbound = state.api_request_to_legacy(&json!({
+        "req": "set_api_key",
+        "id": 52,
+        "provider": "neuralwatt",
+        "api_key": "nw-secret"
+    }));
+    let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+        panic!("compatible preset credential should notify the daemon: {outbound:?}");
+    };
+    assert_eq!(notify["provider"], "neuralwatt");
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("neuralwatt.env")).unwrap(),
+        "NEURALWATT_API_KEY=nw-secret\n"
+    );
+
+    let outbound = state.api_request_to_legacy(&json!({
+        "req": "set_api_key",
+        "id": 53,
+        "provider": "openai-compatible:my-gw",
+        "api_key": "gw-secret-2"
+    }));
+    let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+        panic!("prefixed profile id should resolve: {outbound:?}");
+    };
+    assert_eq!(notify["provider"], "my-gw");
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("provider-my-gw.env")).unwrap(),
+        "MY_GW_API_KEY=gw-secret-2\n"
+    );
+
+}
+
+#[test]
+fn provider_profile_requests_round_trip_and_refuse_builtins() {
+    let home = ScopedJcodeHome::new("provider-profiles");
+    let mut state = BridgeState::default();
+
+    let outbound = state.api_request_to_legacy(&json!({
+        "req": "provider_add",
+        "id": 61,
+        "name": "my-gw",
+        "base_url": "https://llm.example.com/v1",
+        "model": "model-a",
+        "api_key": "gw-secret"
+    }));
+    let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+        panic!("provider add should notify the daemon: {outbound:?}");
+    };
+    assert_eq!(notify["provider"], "my-gw");
+    let legacy_id = notify["id"].as_u64().unwrap();
+    let frames = state.legacy_event_to_api(&json!({"type": "ack", "id": legacy_id}));
+    assert!(matches!(frames[0].event, ApiEvent::Ok));
+
+    let config = std::fs::read_to_string(home.path.join("config.toml")).unwrap();
+    assert!(config.contains("[providers.my-gw]"));
+    let env_file =
+        std::fs::read_to_string(home.path.join("config/jcode/provider-my-gw.env")).unwrap();
+    assert!(env_file.contains("JCODE_PROVIDER_MY_GW_API_KEY=gw-secret"));
+
+    let event = only_reply_event(state.api_request_to_legacy(&json!({
+        "req": "provider_remove",
+        "id": 62,
+        "name": "openai"
+    })));
+    assert!(matches!(
+        event,
+        ApiEvent::Error {
+            code: ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+
+    let outbound = state.api_request_to_legacy(&json!({
+        "req": "provider_remove",
+        "id": 63,
+        "name": "my-gw"
+    }));
+    let [Outbound::Legacy(notify)] = outbound.as_slice() else {
+        panic!("provider remove should notify the daemon: {outbound:?}");
+    };
+    let legacy_id = notify["id"].as_u64().unwrap();
+    let frames = state.legacy_event_to_api(&json!({"type": "ack", "id": legacy_id}));
+    assert!(matches!(frames[0].event, ApiEvent::Ok));
+
+    let config = std::fs::read_to_string(home.path.join("config.toml")).unwrap();
+    assert!(!config.contains("[providers.my-gw]"));
+    assert!(!home.path.join("config/jcode/provider-my-gw.env").exists());
+}

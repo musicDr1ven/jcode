@@ -517,7 +517,17 @@ pub type Progress<'a> = dyn Fn(&str) + 'a;
 
 /// Whether anything is listening on a socket path.
 pub fn socket_accepts(path: &Path) -> bool {
-    jcode_transport::is_socket_path(path)
+    // `is_socket_path` is an existence check on Unix, so a stale socket file
+    // left by a dead daemon or bridge counted as "the runtime is up". Probe an
+    // actual connection instead; Windows already probes the named pipe.
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        jcode_transport::is_socket_path(path)
+    }
 }
 
 /// Locate a sibling executable next to our own, falling back to `$PATH`.
@@ -552,7 +562,26 @@ pub fn ensure_runtime(options: &LaunchOptions, progress: &Progress<'_>) -> Resul
         shared_upgrade::offer(&legacy, &jcode, options.start_timeout, progress);
     }
     if socket_accepts(&api) {
-        return Ok(());
+        // A bridge can outlive its daemon: the daemon exits after idling out
+        // while the bridge keeps accepting connections whose streams close
+        // immediately. Only the default local pair can be repaired this way; a
+        // forwarded remote API socket has no local daemon to compare against.
+        #[cfg(unix)]
+        let stale = {
+            let local_api = jcode_harness_api::api_socket_path();
+            api == local_api && !socket_accepts(&legacy)
+        };
+        #[cfg(not(unix))]
+        let stale = false;
+        if !stale {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&api);
+            let _ = fs::remove_file(api.with_extension("lock"));
+            progress("replacing a harness API bridge whose runtime exited");
+        }
     }
     if !socket_accepts(&legacy) {
         progress("starting jcode runtime...");
@@ -1263,5 +1292,23 @@ mod tests {
             daemon.is_running(),
             "failed launch stopped a daemon it did not start"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_accepts_probes_instead_of_trusting_a_stale_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("stale.sock");
+        // Binding then dropping leaves the file behind with no listener.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the stale socket file should remain");
+        assert!(
+            !socket_accepts(&path),
+            "a stale socket file must not count as a running runtime"
+        );
+        std::fs::remove_file(&path).expect("remove stale socket");
+        let live = std::os::unix::net::UnixListener::bind(&path).expect("rebind");
+        assert!(socket_accepts(&path), "a live listener must accept");
+        drop(live);
     }
 }

@@ -274,6 +274,32 @@ pub async fn run_bridge(api_socket: PathBuf, legacy_socket: PathBuf) -> Result<(
         api_socket.display(),
         legacy_socket.display()
     );
+    // Exit when the daemon this bridge fronts is gone. The daemon shuts down
+    // after idling out; a bridge left behind keeps accepting connections and
+    // closing them, which makes the runtime look alive to every client. Give a
+    // self-dev reload a grace period before giving up. Do not unlink the API
+    // socket here: a replacement bridge may already own that path.
+    {
+        let legacy = legacy_socket.clone();
+        tokio::spawn(async move {
+            let mut missed = 0u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if legacy_daemon_accepts(&legacy) {
+                    missed = 0;
+                } else {
+                    missed += 1;
+                    if missed >= 15 {
+                        eprintln!(
+                            "harness API bridge: daemon {} is gone; exiting",
+                            legacy.display()
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            }
+        });
+    }
     loop {
         let (stream, _) = listener.accept().await?;
         let legacy = legacy_socket.clone();
@@ -284,6 +310,17 @@ pub async fn run_bridge(api_socket: PathBuf, legacy_socket: PathBuf) -> Result<(
             // A closed client drops its translation state and buffers.
             allocator::trim();
         });
+    }
+}
+
+fn legacy_daemon_accepts(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        jcode_transport::is_socket_path(path)
     }
 }
 

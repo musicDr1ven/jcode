@@ -125,3 +125,10 @@ Jcode is inventing a new form of customizability. One that doesn't limit you to 
 - [Token optimization](docs/HARNESS.md#token-optimization)
 - [KV cache](docs/HARNESS.md#kv-cache)
 - [Hill-climbable measurements](docs/HARNESS.md#hill-climbable-measurements)
+
+```
+cd ~/Working/dev_tools/jcode
+JCODE_INSTALL_DIR="$(mktemp -d)" scripts/install_release.sh
+
+scripts/build_linux_compat.sh
+```

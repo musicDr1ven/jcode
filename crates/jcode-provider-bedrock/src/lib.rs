@@ -680,6 +680,32 @@ impl BedrockProvider {
         Ok(format!("{prefix}.{DEFAULT_MODEL}"))
     }
 
+    /// Effort capabilities for a Bedrock model id, from the shared Anthropic
+    /// table: `Some` only for Claude models that take `output_config.effort`
+    /// with adaptive thinking (Opus 4.6+, Sonnet 4.6+, Fable, Haiku 5, ...).
+    /// Manual-thinking models (Opus 4.5, Claude 3.7) and non-Claude models
+    /// get `None`, so nothing is sent.
+    fn effort_caps(model: &str) -> Option<jcode_provider_core::AnthropicReasoningCaps> {
+        let id = Self::normalize_model_id(model).to_ascii_lowercase();
+        let base = id.strip_prefix("anthropic.").unwrap_or(&id);
+        // Bedrock version suffix ("-v1:0"); the caps parser ignores "-v1" itself
+        let base = base.split(':').next().unwrap_or(base);
+        let caps = jcode_provider_core::anthropic_reasoning_caps(base);
+        (caps.output_effort && caps.adaptive_thinking).then_some(caps)
+    }
+
+    /// Clamp a level to the model's ladder: `max` falls to `xhigh` or `high`,
+    /// `xhigh` to `high`.
+    fn clamp_effort(effort: &str, caps: jcode_provider_core::AnthropicReasoningCaps) -> String {
+        match effort {
+            "max" if !caps.max_effort => {
+                if caps.xhigh_effort { "xhigh" } else { "high" }.to_string()
+            }
+            "xhigh" if !caps.xhigh_effort => "high".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     fn normalize_model_id(model: &str) -> String {
         let mut value = model.trim().to_string();
         if let Some((_, tail)) = value.rsplit_once('/') {
@@ -1365,17 +1391,22 @@ impl Provider for BedrockProvider {
         self.model.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// The effort sent as `output_config.effort`: the stored level, clamped
+    /// to what the model accepts, for every Bedrock Claude model that takes
+    /// effort with adaptive thinking. Unset, only the Opus 5.5 default sends
+    /// one (`low`); every other model keeps its own default.
     fn reasoning_effort(&self) -> Option<String> {
-        if Self::normalize_model_id(&self.model()) != DEFAULT_MODEL {
-            return None;
-        }
-        Some(
-            self.effort
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone()
-                .unwrap_or_else(|| "low".to_string()),
-        )
+        let model = self.model();
+        let caps = Self::effort_caps(&model)?;
+        let stored = self
+            .effort
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let effort = stored.or_else(|| {
+            (Self::normalize_model_id(&model) == DEFAULT_MODEL).then(|| "low".to_string())
+        })?;
+        Some(Self::clamp_effort(&effort, caps))
     }
 
     fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
@@ -1384,8 +1415,12 @@ impl Provider for BedrockProvider {
             effort.as_str(),
             "low" | "medium" | "high" | "xhigh" | "max" | "default"
         ) {
+            anyhow::bail!("Bedrock effort must be low, medium, high, xhigh, max, or default");
+        }
+        if effort != "default" && Self::effort_caps(&self.model()).is_none() {
             anyhow::bail!(
-                "Bedrock Opus 5.5 effort must be low, medium, high, xhigh, max, or default"
+                "Bedrock model {} does not take a reasoning effort",
+                self.model()
             );
         }
         *self.effort.write().unwrap_or_else(|p| p.into_inner()) =

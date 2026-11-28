@@ -26,8 +26,15 @@ Opus 5.5 requests omit temperature and top-p overrides, retain token limits and
 stop sequences, and use low effort by default. `JCODE_BEDROCK_EFFORT` or the
 provider effort setter can select `low`, `medium`, `high`, `xhigh`, or `max`.
 The setter's `default` choice restores low. Effort is sent through Converse's
-`additionalModelRequestFields.output_config.effort`; older models do not receive
-this field. Unknown effort values fail before dispatch. Application profile
+`additionalModelRequestFields.output_config.effort`.
+
+A set effort also reaches every other Claude model that takes one with adaptive
+thinking (Opus 4.6+, Sonnet 4.6+ including Sonnet 5.5, Fable, Haiku 5), from the
+shared `anthropic_reasoning_caps` table. It is clamped to the model's ladder
+(`max` falls to `xhigh` or `high`, `xhigh` to `high`). Unset, those models get no
+effort, so their own default applies. Manual-thinking models (Opus 4.5,
+Claude 3.7) and non-Claude models never receive the field, and the setter
+rejects a level for them. Unknown effort values fail before dispatch. Application profile
 ARNs with opaque IDs cannot be identified as Opus 5.5, so model-specific metadata,
 sampling filtering and low-effort defaults cannot be inferred for those ARNs.
 

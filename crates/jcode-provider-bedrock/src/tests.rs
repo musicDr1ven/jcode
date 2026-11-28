@@ -135,6 +135,54 @@ fn opus_low_effort_default_and_explicit_overrides() {
 }
 
 #[test]
+fn effort_reaches_every_bedrock_claude_model_that_takes_it() {
+    let _guard = lock_test_env();
+    let _model = EnvVarGuard::remove("JCODE_BEDROCK_MODEL");
+    let _effort = EnvVarGuard::remove("JCODE_BEDROCK_EFFORT");
+    let p = BedrockProvider::new();
+
+    // Sonnet 5.5: nothing sent until set (the model's own default applies)
+    p.set_model("anthropic.claude-sonnet-5-5").unwrap();
+    assert_eq!(p.reasoning_effort(), None);
+    #[cfg(feature = "aws-sdk")]
+    assert_eq!(p.additional_request_fields().unwrap(), None);
+    p.set_reasoning_effort("medium").unwrap();
+    assert_eq!(p.reasoning_effort().as_deref(), Some("medium"));
+    #[cfg(feature = "aws-sdk")]
+    assert_eq!(
+        p.additional_request_fields().unwrap(),
+        Some(BedrockProvider::json_to_document(
+            &json!({"output_config": {"effort": "medium"}})
+        ))
+    );
+    // region profiles and version suffixes resolve to the same model
+    p.set_model("us.anthropic.claude-sonnet-5-5-v1:0").unwrap();
+    assert_eq!(p.reasoning_effort().as_deref(), Some("medium"));
+
+    // clamped to the model's ladder: Opus 4.6 has max but no xhigh
+    p.set_model("anthropic.claude-opus-4-6-v1").unwrap();
+    p.set_reasoning_effort("xhigh").unwrap();
+    assert_eq!(p.reasoning_effort().as_deref(), Some("high"));
+    p.set_reasoning_effort("max").unwrap();
+    assert_eq!(p.reasoning_effort().as_deref(), Some("max"));
+
+    // manual-thinking and non-Claude models never get one
+    p.set_model("anthropic.claude-opus-4-5-20251101-v1:0").unwrap();
+    assert_eq!(p.reasoning_effort(), None);
+    assert!(p.set_reasoning_effort("high").is_err());
+    assert!(p.set_reasoning_effort("default").is_ok());
+    p.set_model("amazon.nova-pro-v1:0").unwrap();
+    assert_eq!(p.reasoning_effort(), None);
+    assert!(p.set_reasoning_effort("low").is_err());
+
+    // clearing returns Opus 5.5 to its low default and others to none
+    p.set_model("anthropic.claude-opus-5-5").unwrap();
+    assert_eq!(p.reasoning_effort().as_deref(), Some("low"));
+    p.set_model("anthropic.claude-haiku-5-5").unwrap();
+    assert_eq!(p.reasoning_effort(), None);
+}
+
+#[test]
 fn opus_default_routes_stay_in_geography() {
     for (regions, prefix) in [
         (
